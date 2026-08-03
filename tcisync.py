@@ -36,7 +36,7 @@ from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from spot_feed import SpotFeed
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(_BASE_DIR, "tcisync_settings.json")

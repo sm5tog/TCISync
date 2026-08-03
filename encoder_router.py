@@ -73,6 +73,7 @@ class EncoderRouter:
             self.panel_map.update(panel_map)
         self._acc = {"vfo_main": 0, "knob_left": 0, "knob_center": 0, "knob_right": 0}
         self._ts = {}
+        self._sent = {}   # tag -> senast skickade värde (för äkta eko-jämförelse, se _guard/_echoed)
         self._mon_volume = {}   # radio_key -> senast kända MON_VOLUME (dB), från prime()/eko
         self._mon_restore = {}  # radio_key -> nivå att återställa till efter nyckling
         cw = cw_settings or {}
@@ -106,11 +107,32 @@ class EncoderRouter:
             link.send(cmd)
 
     # ----- eko-spärr -----------------------------------------------------------
-    def _guard(self, tag):
-        self._ts[tag] = time.time()
+    _BLOCK_ANY = object()   # se _guard(block_any=True)/_echoed
 
-    def _echoed(self, tag, known):
-        return known is not None and time.time() - self._ts.get(tag, 0) < ECHO_WINDOW
+    def _guard(self, tag, value=None, block_any=False):
+        """value = det vi just skickade för tag, sparas för att kunna skilja
+        på ett äkta eko (radion bekräftar SAMMA värde - ignoreras) och en
+        legitim korrigering (radion självmant ändrade till ett ANNAT värde,
+        t.ex. dess egna VFO B-auto-snap vid split på/av - ska alltid släppas
+        igenom, se _echoed). block_any=True (bara `apply_tx`s VFO B-korrigering
+        vid split-på) blockerar MEDVETET allt inom fönstret oavsett värde,
+        eftersom radions auto-hopp-eko där är känt och oönskat, inte en
+        legitim korrigering vi vill se."""
+        self._ts[tag] = time.time()
+        self._sent[tag] = self._BLOCK_ANY if block_any else value
+
+    def _echoed(self, tag, incoming):
+        """True om incoming ska ignoreras: antingen `block_any`-läge (se
+        _guard), eller ett äkta eko (incoming matchar exakt det VI skickade).
+        Skiljer sig från den gamla logiken som blockerade ALLA inkommande
+        värden i fönstret oavsett om de matchade, vilket lät radions egna
+        korrigeringar tystas och lämnade appens modell felsynkad mot radion."""
+        if time.time() - self._ts.get(tag, 0) >= ECHO_WINDOW:
+            return False
+        if tag not in self._sent:
+            return False
+        sent = self._sent[tag]
+        return sent is self._BLOCK_ANY or sent == incoming
 
     # ----- panel in ------------------------------------------------------------
     def handle_panel(self, key, kind, value):
@@ -160,11 +182,11 @@ class EncoderRouter:
         # nivå efteråt istället för att bara slå på igen på en okänd/förvald nivå.
         if state:
             self._mon_restore[radio.key] = self._mon_volume.get(radio.key, 0)
-            self._guard(("monvol", radio.key))
+            self._guard(("monvol", radio.key), -60.0)
             self._send(radio.key, "MON_VOLUME:-60;")
         else:
             restore = self._mon_restore.pop(radio.key, 0)
-            self._guard(("monvol", radio.key))
+            self._guard(("monvol", radio.key), float(restore))
             self._send(radio.key, "MON_VOLUME:%g;" % restore)
 
     def _ptt(self, on):
@@ -281,7 +303,7 @@ class EncoderRouter:
             stored = rx.freq[1]
             self._send(radio.key, "SPLIT_ENABLE:%d,true;" % rxi)
             if stored is not None:
-                self._guard(("vfo", radio.key, rxi, 1))
+                self._guard(("vfo", radio.key, rxi, 1), block_any=True)
                 self._send(radio.key, "VFO:%d,1,%d;" % (rxi, stored))
                 rx.freq[1] = stored
         else:
@@ -315,7 +337,7 @@ class EncoderRouter:
         per = min(BASE_STEP * self._step_per_detent(n), ACCEL_PER_MAX)
         new = int(base) + sign * int(round(n * per))
         rx.freq[vfo] = new
-        self._guard(("vfo", radio.key, rxi, vfo))
+        self._guard(("vfo", radio.key, rxi, vfo), new)
         self._send(radio.key, "VFO:%d,%d,%d;" % (rxi, vfo, new))
         return True
 
@@ -323,7 +345,7 @@ class EncoderRouter:
         radio = self.station.tx_radio()
         cur = radio.wpm if radio.wpm is not None else 25
         radio.wpm = clamp(int(cur) + delta * WPM_STEP, WPM_MIN, WPM_MAX)
-        self._guard(("wpm", radio.key))
+        self._guard(("wpm", radio.key), radio.wpm)
         self._send(radio.key, "CW_KEYER_SPEED:%d;" % radio.wpm)
         self._send(radio.key, "CW_MACROS_SPEED:%d;" % radio.wpm)
         return True
@@ -331,7 +353,7 @@ class EncoderRouter:
     def _set_wpm(self, value):
         radio = self.station.tx_radio()
         radio.wpm = value
-        self._guard(("wpm", radio.key))
+        self._guard(("wpm", radio.key), value)
         self._send(radio.key, "CW_KEYER_SPEED:%d;" % value)
         self._send(radio.key, "CW_MACROS_SPEED:%d;" % value)
         self._log("WPM = %d" % value)
@@ -342,7 +364,7 @@ class EncoderRouter:
         if radio.drive is None:
             return False
         radio.drive = clamp(int(radio.drive) + delta * DRIVE_STEP, 0, 100)
-        self._guard(("drive", radio.key))
+        self._guard(("drive", radio.key), radio.drive)
         self._send(radio.key, "DRIVE:%d,%d;" % (self.station.tx[1], radio.drive))
         return True
 
@@ -352,7 +374,7 @@ class EncoderRouter:
         rx = radio.rx[rxi]
         cur = rx.rit_offset or 0
         rx.rit_offset = int(cur) + delta * RIT_STEP
-        self._guard(("rit", radio.key, rxi))
+        self._guard(("rit", radio.key, rxi), rx.rit_offset)
         self._send(radio.key, "RIT_OFFSET:%d,%d;" % (rxi, rx.rit_offset))
         return True
 
@@ -401,27 +423,32 @@ class EncoderRouter:
         try:
             if name == "VFO" and len(args) >= 3 and args[0] in ("0", "1") and args[1] in ("0", "1"):
                 rxi, vfo = int(args[0]), int(args[1])
+                incoming = int(args[2])
                 if rxi < radio.rx_count and not self._echoed(
-                        ("vfo", radio.key, rxi, vfo), radio.rx[rxi].freq[vfo]):
-                    radio.rx[rxi].freq[vfo] = int(args[2])
+                        ("vfo", radio.key, rxi, vfo), incoming):
+                    radio.rx[rxi].freq[vfo] = incoming
                     return True
             elif name in ("CW_KEYER_SPEED", "CW_MACROS_SPEED") and len(args) >= 1:
-                if not self._echoed(("wpm", radio.key), radio.wpm):
-                    radio.wpm = int(float(args[0]))
+                incoming = int(float(args[0]))
+                if not self._echoed(("wpm", radio.key), incoming):
+                    radio.wpm = incoming
                     return True
             elif name == "MON_VOLUME" and len(args) >= 1:
-                if not self._echoed(("monvol", radio.key), self._mon_volume.get(radio.key)):
-                    self._mon_volume[radio.key] = float(args[0])
+                incoming = float(args[0])
+                if not self._echoed(("monvol", radio.key), incoming):
+                    self._mon_volume[radio.key] = incoming
                     return True
             elif name == "DRIVE" and len(args) >= 2 and args[0] in ("0", "1"):
-                if not self._echoed(("drive", radio.key), radio.drive):
-                    radio.drive = int(float(args[1]))
+                incoming = int(float(args[1]))
+                if not self._echoed(("drive", radio.key), incoming):
+                    radio.drive = incoming
                     return True
             elif name == "RIT_OFFSET" and len(args) >= 2 and args[0] in ("0", "1"):
                 rxi = int(args[0])
+                incoming = int(float(args[1]))
                 if rxi < radio.rx_count and not self._echoed(
-                        ("rit", radio.key, rxi), radio.rx[rxi].rit_offset):
-                    radio.rx[rxi].rit_offset = int(float(args[1]))
+                        ("rit", radio.key, rxi), incoming):
+                    radio.rx[rxi].rit_offset = incoming
                     return True
             elif name == "RIT_ENABLE" and len(args) >= 2 and args[0] in ("0", "1"):
                 rxi = int(args[0])
