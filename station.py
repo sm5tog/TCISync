@@ -108,8 +108,38 @@ class Station:
 
 
 def default_station():
-    """Standarduppsättningen: Ramnäs lokalt (2 RX), Blecket remote (1 RX)."""
+    """Fallback-uppsättning (samma som sunsyncs hårdkodade default) - används om
+    auto_station() inte hittar några ExpertSDR3-profiler alls, t.ex. första
+    körningen på en ny dator innan ExpertSDR3 ens anslutit till en radio."""
     return Station([
         Radio("ramnas", "Ramnäs", "127.0.0.1", 50001, "local", 2),
         Radio("blecket", "Blecket", "127.0.0.1", 40001, "remote", 1),
     ])
+
+
+def auto_station(discovered=None):
+    """Bygger en Station från auto-detekterade radioapparater (se
+    expertsdr3_discover.discover()). Lokal radio läggs först (index 0) om den
+    finns, sedan fjärrstyrd - matchar den tidigare hårdkodade ordningen så
+    resten av modellen (t.ex. Station.ear/tx default (0,0,0) = första radion)
+    beter sig som väntat. `Radio.place` sätts direkt från `role`
+    ("local"/"remote" är redan samma värden).
+
+    Faller tillbaka på default_station() om inget hittas alls.
+
+    OBS: bara stationsmodellen byggs om av det här - E-Coder-knappmappningen
+    och cockpitens paneluppställning (`tcisync.py: SLOTS`) är fortfarande
+    hårdkodade mot nycklarna "ramnas"/"blecket" och behöver en egen ändring
+    innan de fungerar med auto-detekterade radioapparater (nästa steg)."""
+    if discovered is None:
+        from expertsdr3_discover import discover
+        discovered = discover()
+    if not discovered:
+        return default_station()
+    order = {"local": 0, "remote": 1}
+    discovered = sorted(discovered, key=lambda r: order.get(r.role, 2))
+    names = {"local": "Lokal", "remote": "Fjärrstyrd"}
+    radios = [Radio(r.serial, names.get(r.role, r.role), "127.0.0.1", r.port,
+                     r.role, r.transceivers)
+              for r in discovered]
+    return Station(radios)

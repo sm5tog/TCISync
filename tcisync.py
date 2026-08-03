@@ -27,7 +27,7 @@ import customtkinter as ctk
 
 import ee_theme as th
 import win_snap
-from station import default_station
+from station import auto_station
 from tci_link import TciLink
 from encoder_router import EncoderRouter
 from audio import AudioSwitch
@@ -80,12 +80,17 @@ STATUS_SCALE = 0.83
 CELL_W = 137      # cellens bredd (px)
 CELL_H = 30       # cellens höjd (px)
 
-# Panelordning: (radio_key, rx_idx, rubrik). En panel per mottagare.
-SLOTS = [
-    ("ramnas", 0, "RX1"),
-    ("ramnas", 1, "RX2"),
-    ("blecket", 0, "Remote RX1"),
-]
+def _build_slots(station):
+    """Panelordning: (radio_key, rx_idx, rubrik), en panel per mottagare -
+    byggd från stationens faktiska (auto-detekterade) radioapparater, inte
+    hårdkodad mot Ramnäs/Blecket-namn."""
+    slots = []
+    for radio in station.radios:
+        prefix = "" if radio.place == "local" else "Remote "
+        for rxi in range(radio.rx_count):
+            label = "%sRX%d" % (prefix, rxi + 1)
+            slots.append((radio.key, rxi, label))
+    return slots
 
 
 def fmt_freq(hz):
@@ -101,7 +106,12 @@ class Cockpit:
         root.title("TCISync (by SM5K)  v%s" % VERSION)
         root.configure(fg_color=th.color("bg_app"))
 
-        self.station = default_station()
+        self.station = auto_station()
+        self.slots = _build_slots(self.station)
+        # jtspots-spots (ATNO/MTH) matchas bara mot den LOKALA radions RX1/RX2
+        # (spot_feed.py-logiken är byggd kring det), inte hårdkodat mot "ramnas".
+        self._local_key = next((r.key for r in self.station.radios if r.place == "local"),
+                                self.station.radios[0].key)
         self.events = queue.Queue()
         self.links = {}
         self.cells = {}         # (radio_key, rx_idx, vfo) -> CTkLabel (frekvenstext)
@@ -217,7 +227,7 @@ class Cockpit:
         wrap = ctk.CTkFrame(self.root, fg_color=th.color("bg_app"))
         wrap.pack(fill="both", expand=True, padx=pad, pady=(pad - 4, 0))
         self._bind_drag(wrap)
-        for i, slot in enumerate(SLOTS):
+        for i, slot in enumerate(self.slots):
             self._rx_panel(wrap, slot, i)
             wrap.columnconfigure(i, weight=1)
         wrap.rowconfigure(0, weight=1)
@@ -281,7 +291,7 @@ class Cockpit:
                 w.bind("<Button-1>", lambda e, k=key: self._cell_click(k, "ear"))
                 w.bind("<Button-3>", lambda e, k=key: self._cell_click(k, "tx"))
 
-        if radio_key == "ramnas" and rxi in (0, 1):
+        if radio_key == self._local_key and rxi in (0, 1):
             spot_lbl = ctk.CTkLabel(f, text="", anchor="w",
                                     text_color=th.color("accent_orange_bright"),
                                     font=self.f_status, cursor="hand2")
@@ -300,7 +310,7 @@ class Cockpit:
         spot = self.last_spot.get(rxi)
         if spot is None:
             return
-        link = self.links.get("ramnas")
+        link = self.links.get(self._local_key)
         if link is not None:
             link.send("VFO:0,%d,%d;" % (rxi, spot["freq_hz"]))
 
