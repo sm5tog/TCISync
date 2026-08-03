@@ -3,24 +3,24 @@
 """expertsdr3_discover.py - hittar aktiva ExpertSDR3-TCI-servrar på den här datorn
 genom att läsa ExpertSDR3:s egna profilfiler, istället för hårdkodad IP/port.
 
-Profilfilerna ligger i %LOCALAPPDATA%\\Expert Electronics\\ExpertSDR3\\ och heter
-<enhetsserienummer>.json (t.ex. EED06511900116.json) för en LOKAL ExpertSDR3-
-instans (även en instans som själv fjärrstyr en annan radio via ERS räknas som
-"lokal" här - det är DEN INSTANSEN som kör en öppen TCI-server på den här datorn).
+Profilfilerna ligger i %LOCALAPPDATA%\\Expert Electronics\\ExpertSDR3\\ och det
+finns TVÅ filer per enhetsserienummer:
+    <serienummer>.json          - profilen för att ansluta LOKALT (LAN/USB)
+    remote_<serienummer>.json   - profilen för att ansluta via ERS FJÄRRSTYRT
 
-Filer prefixade "remote_<serienummer>.json" beskriver ett ANNAT scenario (den här
-enhetens profil NÄR NÅGON ANNAN fjärransluter till DEN) och är irrelevanta för
-detektion av vad vi själva kan ansluta till - de ignoreras.
+Verifierat 2026-08-03 mot en riktig tvåradio-uppsättning (en lokal, en fjärrstyrd)
+genom att jämföra filernas ändringstid: den fil som faktiskt används just nu har
+ett färskt mtime, den andra (samma enhet, andra anslutningssättet) är gammal.
+`remote_`-varianten hade dessutom redan `transceivers=1` (ERS begränsar till
+RX1), medan den lokala hade `transceivers=2` - fältet självt speglar alltså
+korrekt vilket anslutningssätt filen gäller, inget separat runtime-hack behövs.
 
-Relevanta nycklar (verifierade mot riktiga profilfiler 2026-08-03):
-    GlobalProfile_.transceivers  -> hårdvarans mottagarkapacitet (1 eller 2)
+Relevanta nycklar:
+    GlobalProfile_.transceivers  -> antal användbara mottagare för DEN HÄR
+                                     anslutningsvägen (redan ERS-korrigerat
+                                     för remote_-filer)
     Gui.TCI.open                 -> true om TCI-servern är påslagen
     Gui.TCI.port                 -> TCI-porten (alltid 127.0.0.1 lokalt)
-
-OBS: `transceivers` speglar HÅRDVARANS kapacitet, inte en eventuell ERS-
-begränsning till RX1 vid fjärrstyrning (se DESIGN.md §10 i sunsync) - antalet
-faktiskt användbara mottagare kan vara lägre än vad profilen anger och bör
-bekräftas mot radion själv (t.ex. via RX_CHANNEL_ENABLE) när den ansluts.
 """
 
 import glob
@@ -28,38 +28,42 @@ import json
 import os
 import re
 
-_SERIAL_RE = re.compile(r"^EED\d+$")
+_SERIAL_RE = re.compile(r"^(remote_)?EED\d+$")
 
 PROFILE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", ""),
                             "Expert Electronics", "ExpertSDR3")
 
 
 class DiscoveredRadio:
-    def __init__(self, serial, port, transceivers, path):
-        self.serial = serial
+    def __init__(self, serial, role, port, transceivers, mtime, path):
+        self.serial = serial      # utan "remote_"-prefix
+        self.role = role          # "local" eller "remote"
         self.port = port
         self.transceivers = transceivers
+        self.mtime = mtime
         self.path = path
 
     def __repr__(self):
-        return "DiscoveredRadio(serial=%r, port=%r, transceivers=%r)" % (
-            self.serial, self.port, self.transceivers)
+        return "DiscoveredRadio(serial=%r, role=%r, port=%r, transceivers=%r)" % (
+            self.serial, self.role, self.port, self.transceivers)
 
 
 def discover(profile_dir=PROFILE_DIR):
     """Returnerar en lista DiscoveredRadio, en per profilfil vars TCI-server
-    är påslagen (Gui.TCI.open == true). Trasiga/oläsbara filer hoppas tyst
-    över (profilkatalogen innehåller ofta gamla .backup/.corrupt-varianter)."""
+    är påslagen (Gui.TCI.open == true). Trasiga/oläsbara filer och gamla
+    .backup/.corrupt/" - Copy"-varianter hoppas tyst över."""
     found = []
     if not os.path.isdir(profile_dir):
         return found
     for path in glob.glob(os.path.join(profile_dir, "*.json")):
         name = os.path.basename(path)
-        if name.startswith("remote_"):
-            continue
-        serial = name[:-5]   # ta bort ".json"
-        if not _SERIAL_RE.match(serial):
-            continue         # t.ex. bands.json, settings.json, .backup/.corrupt/" - Copy"-varianter
+        stem = name[:-5]   # ta bort ".json"
+        if not _SERIAL_RE.match(stem):
+            continue       # t.ex. bands.json, settings.json, backup-/corrupt-varianter
+        if stem.startswith("remote_"):
+            role, serial = "remote", stem[len("remote_"):]
+        else:
+            role, serial = "local", stem
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -72,8 +76,18 @@ def discover(profile_dir=PROFILE_DIR):
         if port is None:
             continue
         transceivers = data.get("GlobalProfile_", {}).get("transceivers", 1)
-        found.append(DiscoveredRadio(serial, int(port), int(transceivers), path))
-    return found
+        found.append(DiscoveredRadio(serial, role, int(port), int(transceivers),
+                                      os.path.getmtime(path), path))
+    # "open" i profilen uppdateras inte till false vid frånkoppling, den ligger
+    # kvar från senaste gången just den filen begagnades - så samma serienummer
+    # kan dyka upp i BÅDA rollerna om enheten någon gång körts både lokalt och
+    # fjärrstyrt. Vid krock på samma serienummer vinner den med färskast mtime.
+    best = {}
+    for r in found:
+        cur = best.get(r.serial)
+        if cur is None or r.mtime > cur.mtime:
+            best[r.serial] = r
+    return list(best.values())
 
 
 if __name__ == "__main__":
