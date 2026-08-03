@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""tcisync.py - TCISync (by SM5K). Cockpit med öra/TX-mus-modell (DESIGN §9).
+
+KOPIERAD FRÅN sunsync 2026-08-03 som startpunkt för generaliseringen (DESIGN.md §10 i sunsync).
+Denna fil är ännu INTE generaliserad - hårdkodad Ramnäs/Blecket-modell, hårdkodad
+knappmappning m.m. lever kvar tills auto-detektion/config-UI byggs.
+
+Två markörer sätts med musen på frekvenscellerna: vänsterklick = öra (grön ram, du
+hör), högerklick = TX (orange ram, du sänder). Encodern stämmer den ena, E-Coder-
+knapp 13 växlar öra/TX. Knapp 14 = tillfällig TX-lyssning (öra följer TX live), knapp
+12 dess läge (TX / TX+RX). "Hörs nu"-fyllning visar var ljudet kommer från just nu.
+Ljud (audio.py), styrning (encoder_router.py) och synk (sync.py) hänger på stationen.
+
+Trim-läge: `python sunsync.py --tweak` visar reglage för textstorlek/cellmått.
+"""
+
+import sys
+import os
+import json
+import queue
+import threading
+import time
+import tkinter as tk
+
+import customtkinter as ctk
+
+import ee_theme as th
+import win_snap
+from station import default_station
+from tci_link import TciLink
+from encoder_router import EncoderRouter
+from audio import AudioSwitch
+from sync import Sync
+from ecoder_hid import EcoderHid
+from ecoder_decode import Decoder, load_mapping
+from spot_feed import SpotFeed
+
+VERSION = "0.1.0"
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_FILE = os.path.join(_BASE_DIR, "tcisync_settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(d):
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2)
+
+# CW-nyckelns modellparametrar (nyckel "cw" i tcisync_settings.json), för att kunna
+# modelleras/experimenteras med utan kodändring. Defaultvärdena matchar Jonnys
+# ExpertSDR3-profil (Dot 100%, Dash 300%, Dash-Dot pause 100%, Ramp 7ms, Pitch 600Hz).
+DEFAULT_CW_SETTINGS = {
+    "pitch_hz": 600,
+    "ramp_ms": 7,
+    "dot_pct": 100,
+    "dash_pct": 300,
+    "gap_pct": 100,
+    "debounce_ms": 15,
+    "break_in_ms": 400,
+    "ptt_cw_delay_ms": 50,
+}
+
+SPOT_HOST = "127.0.0.1"
+SPOT_PORT = 7300          # jtspots DEFAULT_TPORT
+SPOT_MAX_AGE_S = 3600     # spot försvinner efter denna ålder
+SPOT_AGE_STEP_S = 300     # nedräkning i 5-minutersblock
+
+UI_SCALE = 0.7            # fallback-default för per-roll-skalorna nedan
+FREQ_SCALE = 0.62         # per-roll textskala (trimmat värde 2026-07-27)
+HEAD_SCALE = 0.76
+STATUS_SCALE = 0.83
+CELL_W = 137      # cellens bredd (px)
+CELL_H = 30       # cellens höjd (px)
+
+# Panelordning: (radio_key, rx_idx, rubrik). En panel per mottagare.
+SLOTS = [
+    ("ramnas", 0, "RX1"),
+    ("ramnas", 1, "RX2"),
+    ("blecket", 0, "Remote RX1"),
+]
+
+
+def fmt_freq(hz):
+    if hz is None:
+        return "--- . --- . ---"
+    return "{:,}".format(int(hz)).replace(",", ".")
+
+
+class Cockpit:
+    def __init__(self, root, tweak=False):
+        self.root = root
+        self.tweak = tweak
+        root.title("TCISync (by SM5K)  v%s" % VERSION)
+        root.configure(fg_color=th.color("bg_app"))
+
+        self.station = default_station()
+        self.events = queue.Queue()
+        self.links = {}
+        self.cells = {}         # (radio_key, rx_idx, vfo) -> CTkLabel (frekvenstext)
+        self.cellouter = {}     # -> CTkFrame (öra-ring + storlek)
+        self.cellinner = {}     # -> CTkFrame (TX-ring + hörs-nu-fyllning)
+        self.dots = []          # (dot_widget, radio_key) per panel
+        self.spot_labels = {}   # rxi (0=RX1, 1=RX2, ramnäs) -> CTkLabel
+        self.last_spot = {}     # rxi -> senaste matchande spot-dict (ATNO/MTH/DX/DXP), inkl. "ts"
+
+        # Render-cache: senast satta värde per widget så .configure bara körs vid ändring
+        # (ctk .configure ritar om en canvas varje gång -> annars omritningsstorm).
+        self._cell_text = {}
+        self._outer_bc = {}
+        self._inner_bc = {}
+        self._inner_fg = {}
+        self._dot_col = {}
+        # Färgtokens en gång (undvik dict-uppslag i heta render-loopen).
+        self._c_inv = th.color("bg_control")
+        self._c_green = th.color("accent_green")
+        self._c_green_b = th.color("accent_green_bright")
+        self._c_orange = th.color("accent_orange")
+        self._c_orange_b = th.color("accent_orange_bright")
+        self._c_txred = th.color("status_tx")
+        self._c_heard = th.color("bg_heard")
+        self._c_conn = th.color("status_connected")
+        self._c_disc = th.color("status_disconnected")
+
+        self.scales = {"freq": FREQ_SCALE, "head": HEAD_SCALE, "status": STATUS_SCALE}
+        self.cell_w = CELL_W
+        self.cell_h = CELL_H
+        self._scalable_fonts = []   # (CTkFont, bas-px, grupp)
+
+        self.f_freq = self._reg_font("freq_main", "freq")
+        self.f_head = self._reg_font("body", "head", bold=True)
+        # "status"-gruppen skalar nu synk-stripan (kryssrutor + knapp), statusraden borttagen.
+        self.f_status = self._reg_font("label", "status")
+        self.f_btn = self._reg_font("small", "status", bold=True)
+
+        cw_cfg = dict(DEFAULT_CW_SETTINGS)
+        cw_cfg.update(load_settings().get("cw", {}))
+        self.router = EncoderRouter(self.station, self.links, log=self._log, cw_settings=cw_cfg)
+        self.audio = AudioSwitch(self.station, self.links, log=self._log)
+        self.sync = Sync(self.station, self.links, log=self._log)
+        self._last_audible = self._audible_key()
+
+        self._build_ui()
+
+        for r in self.station.radios:
+            link = TciLink(r.key, r.ip, r.port, self.events)
+            self.links[r.key] = link
+            link.start()
+
+        self._start_hid()
+
+        self.spot_feed = SpotFeed(SPOT_HOST, SPOT_PORT, self.events)
+        self.spot_feed.start()
+
+        root.after(20, self._pump)
+        root.after(15000, self._spot_tick)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._refresh()
+
+    def _spot_tick(self):
+        """Uppdaterar spot-nedräkningen/utgången även utan nya spot-händelser."""
+        self._refresh_spots()
+        self.root.after(15000, self._spot_tick)
+
+    def _log(self, text):
+        print(text, flush=True)
+
+    def _reg_font(self, role, group, bold=None):
+        base = th.FONT.get(role, th.FONT["body"])
+        fo = th.font(role, bold=bold, scale=self.scales[group])
+        self._scalable_fonts.append((fo, base, group))
+        return fo
+
+    def _audible_key(self):
+        return tuple(sorted(self.station.audible_cells()))
+
+    def _key(self, cell):
+        """(radio_idx, rx_idx, vfo) -> cell-nyckel (radio_key, rx_idx, vfo)."""
+        return (self.station.radios[cell[0]].key, cell[1], cell[2])
+
+    # ----- HID (E-Coder) -------------------------------------------------------
+    def _start_hid(self):
+        self.hid = None
+        self.stop_flag = threading.Event()
+        self.mapping, _ = load_mapping()
+        self.decoder = Decoder(self.mapping)
+        hid = EcoderHid()
+        try:
+            hid.open()
+        except OSError as e:
+            self._log("E-Coder ej öppnad: %s" % e)
+            return
+        self.hid = hid
+        threading.Thread(target=self._reader_loop, daemon=True).start()
+
+    def _reader_loop(self):
+        while not self.stop_flag.is_set():
+            try:
+                r = self.hid.read(150)
+            except OSError:
+                break
+            if r is not None:
+                for key, kind, value in self.decoder.feed(r):
+                    self.events.put({"src": "panel", "key": key,
+                                     "kind": kind, "value": value})
+
+    # ----- UI ------------------------------------------------------------------
+    def _build_ui(self):
+        pad = th.METRICS["panel_pad"]
+        wrap = ctk.CTkFrame(self.root, fg_color=th.color("bg_app"))
+        wrap.pack(fill="both", expand=True, padx=pad, pady=(pad - 4, 0))
+        self._bind_drag(wrap)
+        for i, slot in enumerate(SLOTS):
+            self._rx_panel(wrap, slot, i)
+            wrap.columnconfigure(i, weight=1)
+        wrap.rowconfigure(0, weight=1)
+
+        self._sync_bar(pad)
+
+        if self.tweak:
+            self._tweak_bar(pad)
+
+    def _rx_panel(self, parent, slot, col):
+        M = th.METRICS
+        radio_key, rxi, title = slot
+        radio = self.station.by_key(radio_key)
+        f = ctk.CTkFrame(parent, fg_color=th.color("bg_surface"),
+                         corner_radius=M["radius"], border_width=1,
+                         border_color=th.color("border"))
+        f.grid(row=0, column=col, sticky="nsew", padx=M["gap"] + 2, pady=0)
+        self._bind_drag(f)
+
+        head = ctk.CTkFrame(f, fg_color="transparent")
+        head.pack(fill="x", padx=M["panel_pad"], pady=(5, 2))
+        self._bind_drag(head)
+        dot = ctk.CTkLabel(head, text="●", text_color=th.color("status_disconnected"),
+                           font=self.f_head)
+        dot.pack(side="left")
+        self._bind_drag(dot)
+        self.dots.append((dot, radio_key))
+        place = "lokal" if radio.place == "local" else "remote"
+        titlbl = ctk.CTkLabel(head, text="%s   %s · %s" % (title, radio.name, place),
+                              text_color=th.color("text_primary"), font=self.f_head)
+        titlbl.pack(side="left", padx=5)
+        self._bind_drag(titlbl)
+
+        grid = ctk.CTkFrame(f, fg_color="transparent")
+        grid.pack(fill="x", padx=M["panel_pad"], pady=(0, M["panel_pad"] - 4))
+        # Storleken styrs av frekvens-ETIKETTENS width/height (customtkinter respekterar
+        # det, till skillnad från CTkFrame + grid_propagate(False) som ignoreras här).
+        # Ramarna krymper runt etiketten (ingen fyllning), så cellen blir exakt cell_w x
+        # cell_h. RX-titeln bredvid borttagen; rubriken står kvar ovanför i panelhuvudet.
+        for vfo in (0, 1):
+            outer = ctk.CTkFrame(grid, fg_color=th.color("bg_control"),
+                                 corner_radius=M["radius"], border_width=2,
+                                 border_color=th.color("bg_control"))
+            outer.grid(row=0, column=vfo, padx=M["gap"], pady=M["gap"])
+            inner = ctk.CTkFrame(outer, fg_color=th.color("bg_control"),
+                                 corner_radius=max(1, M["radius"] - 1), border_width=2,
+                                 border_color=th.color("bg_control"))
+            inner.pack(padx=2, pady=2)      # luft mellan öra-ringen (yttre) och TX-ringen (inre)
+            # Etikettmarginal så inre ramens kant (TX-ring) + fg ("hörs nu") syns runt texten.
+            lbl = ctk.CTkLabel(inner, text=fmt_freq(None),
+                               width=self.cell_w, height=self.cell_h,
+                               fg_color="transparent",
+                               text_color=th.color("text_freq"), font=self.f_freq)
+            lbl.pack(padx=6, pady=2)
+            grid.columnconfigure(vfo, weight=1)
+            key = (radio_key, rxi, vfo)
+            self.cells[key] = lbl
+            self.cellouter[key] = outer
+            self.cellinner[key] = inner
+            for w in (outer, inner, lbl):
+                w.bind("<Button-1>", lambda e, k=key: self._cell_click(k, "ear"))
+                w.bind("<Button-3>", lambda e, k=key: self._cell_click(k, "tx"))
+
+        if radio_key == "ramnas" and rxi in (0, 1):
+            spot_lbl = ctk.CTkLabel(f, text="", anchor="w",
+                                    text_color=th.color("accent_orange_bright"),
+                                    font=self.f_status, cursor="hand2")
+            spot_lbl.pack(fill="x", padx=M["panel_pad"], pady=(0, 4))
+            spot_lbl.bind("<Button-1>", lambda e, rx=rxi: self._spot_click(rx))
+            self.spot_labels[rxi] = spot_lbl
+
+    def _cell_click(self, key, which):
+        radio_key, rxi, vfo = key
+        cell = (self.station.index_of(radio_key), rxi, vfo)
+        dirty = self.router.set_ear(cell) if which == "ear" else self.router.set_tx(cell)
+        if dirty:
+            self._refresh()
+
+    def _spot_click(self, rxi):
+        spot = self.last_spot.get(rxi)
+        if spot is None:
+            return
+        link = self.links.get("ramnas")
+        if link is not None:
+            link.send("VFO:0,%d,%d;" % (rxi, spot["freq_hz"]))
+
+    # ----- synk-stripa ---------------------------------------------------------
+    def _sync_bar(self, pad):
+        bar = ctk.CTkFrame(self.root, fg_color=th.color("bg_surface"),
+                           corner_radius=th.METRICS["radius"])
+        bar.pack(fill="x", padx=pad, pady=(4, 0))
+        self._bind_drag(bar)
+        self.sync_btn = ctk.CTkButton(bar, text="Synk av", font=self.f_btn,
+                                      height=th.METRICS["btn_height"], width=90,
+                                      corner_radius=th.METRICS["radius"],
+                                      fg_color=th.color("btn_idle_bg"),
+                                      hover_color=th.color("btn_hover_bg"),
+                                      text_color=th.color("btn_text"),
+                                      command=self._on_sync_toggle)
+        self.sync_btn.pack(side="left", padx=(8, 10), pady=4)
+        params = [("vfo", "Frekvens", "sync_vfo"), ("mod", "Mode", "sync_mod"),
+                  ("vfob", "VFO B", "sync_vfob"), ("rit", "RIT", "sync_rit"),
+                  ("filter", "Filter", "sync_filter")]
+        self._sync_vars = {}
+        for key, label, attr in params:
+            var = ctk.BooleanVar(value=getattr(self.sync, attr))
+            cb = ctk.CTkCheckBox(bar, text=label, variable=var,
+                                 font=self.f_status, checkbox_width=16, checkbox_height=16,
+                                 text_color=th.color("text_secondary"),
+                                 fg_color=th.color("accent_blue"),
+                                 hover_color=th.color("accent_blue_bright"),
+                                 command=lambda k=key, a=attr: self._on_sync_param(k, a))
+            cb.pack(side="left", padx=6, pady=4)
+            self._sync_vars[key] = var
+
+    def _on_sync_toggle(self):
+        self.station.sync_mode = not self.station.sync_mode
+        on = self.station.sync_mode
+        self.sync_btn.configure(
+            text="Synk på" if on else "Synk av",
+            fg_color=th.color("accent_blue") if on else th.color("btn_idle_bg"),
+            hover_color=th.color("accent_blue_bright") if on else th.color("btn_hover_bg"))
+        self._log("Synk %s" % ("på" if on else "av"))
+        if on:
+            self.sync.align()          # snäpp remoten till RX1 direkt vid påslag
+
+    def _on_sync_param(self, key, attr):
+        setattr(self.sync, attr, self._sync_vars[key].get())
+
+    # ----- trim-läge -----------------------------------------------------------
+    def _tweak_bar(self, pad):
+        bar = ctk.CTkFrame(self.root, fg_color=th.color("bg_control"),
+                           corner_radius=th.METRICS["radius"])
+        bar.pack(fill="x", padx=pad, pady=(4, 0))
+        self._sliders = {}
+        self._sl_val = {}
+
+        def add(key, label, lo, hi, val, cb):
+            row = ctk.CTkFrame(bar, fg_color="transparent")
+            row.pack(fill="x", padx=8, pady=2)
+            ctk.CTkLabel(row, text=label, width=90, anchor="w",
+                         text_color=th.color("text_primary"),
+                         font=th.font("small")).pack(side="left")
+            s = ctk.CTkSlider(row, from_=lo, to=hi, command=cb)
+            s.set(val)
+            s.pack(side="left", fill="x", expand=True, padx=6)
+            v = ctk.CTkLabel(row, text="", width=52,
+                             text_color=th.color("accent_green_bright"),
+                             font=th.font("small"))
+            v.pack(side="left")
+            self._sliders[key] = s
+            self._sl_val[key] = v
+
+        add("freq", "Frekvens", 0.4, 1.6, self.scales["freq"], lambda v: self._on_font("freq", v))
+        add("head", "Panelrubrik", 0.4, 1.6, self.scales["head"], lambda v: self._on_font("head", v))
+        add("status", "Status", 0.4, 1.6, self.scales["status"], lambda v: self._on_font("status", v))
+        add("cw", "Cellbredd", 70, 260, self.cell_w, self._on_cw)
+        add("ch", "Cellhöjd", 22, 80, self.cell_h, self._on_ch)
+
+        btnrow = ctk.CTkFrame(bar, fg_color="transparent")
+        btnrow.pack(fill="x", padx=8, pady=(2, 6))
+        self.copy_btn = ctk.CTkButton(btnrow, text="Kopiera värden",
+                                      fg_color=th.color("accent_blue"),
+                                      hover_color=th.color("accent_blue_bright"),
+                                      font=th.font("small"), height=22, width=120,
+                                      corner_radius=th.METRICS["radius"],
+                                      command=self._copy_values)
+        self.copy_btn.pack(side="left")
+        self.copy_lbl = ctk.CTkLabel(btnrow, text="", text_color=th.color("text_secondary"),
+                                     font=th.font("small"))
+        self.copy_lbl.pack(side="left", padx=8)
+        self._update_tweak_labels()
+
+    def _rescale_fonts(self, group=None):
+        for fo, base, g in self._scalable_fonts:
+            if group is None or g == group:
+                fo.configure(size=max(1, round(base * self.scales[g])))
+
+    def _resize_cells(self):
+        # Cellstorleken styrs av frekvens-etikettens width/height; ramarna krymper runt.
+        for lbl in self.cells.values():
+            lbl.configure(width=self.cell_w, height=self.cell_h)
+
+    def _update_tweak_labels(self):
+        for g in ("freq", "head", "status"):
+            self._sl_val[g].configure(text="%.2f" % self.scales[g])
+        self._sl_val["cw"].configure(text="%d px" % self.cell_w)
+        self._sl_val["ch"].configure(text="%d px" % self.cell_h)
+
+    def _on_font(self, group, v):
+        self.scales[group] = round(float(v), 2)
+        self._rescale_fonts(group)
+        self._update_tweak_labels()
+
+    def _on_cw(self, v):
+        self.cell_w = int(round(float(v)))
+        self._resize_cells()
+        self._update_tweak_labels()
+
+    def _on_ch(self, v):
+        self.cell_h = int(round(float(v)))
+        self._resize_cells()
+        self._update_tweak_labels()
+
+    def _copy_values(self):
+        s = self.scales
+        txt = ("FREQ_SCALE = %.2f   HEAD_SCALE = %.2f   STATUS_SCALE = %.2f   "
+               "CELL_W = %d   CELL_H = %d") % (
+            s["freq"], s["head"], s["status"], self.cell_w, self.cell_h)
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(txt)
+        except Exception:
+            pass
+        print(txt, flush=True)
+        self.copy_lbl.configure(text="Kopierat: " + txt)
+
+    # ----- händelsepump --------------------------------------------------------
+    def _pump(self):
+        dirty = False
+        try:
+            while True:
+                ev = self.events.get_nowait()
+                if ev.get("src") == "panel":
+                    if self.router.handle_panel(ev["key"], ev["kind"], ev["value"]):
+                        dirty = True
+                elif ev.get("kind") == "status":
+                    self._on_status(ev)
+                    dirty = True
+                elif ev.get("kind") == "cmd":
+                    if self.router.handle_tci(ev):
+                        dirty = True
+                    self.sync.relay(ev)
+                elif ev.get("kind") == "log":
+                    self._log(ev.get("text", ""))
+                elif ev.get("kind") == "spot":
+                    rxi = 1 if ev["digital"] else 0
+                    ev["ts"] = time.time()
+                    self.last_spot[rxi] = ev
+                    dirty = True
+        except queue.Empty:
+            pass
+        if self.router.flush():
+            dirty = True
+        audible = self._audible_key()
+        if audible != self._last_audible:
+            self._last_audible = audible
+            self.audio.apply()
+        if dirty:
+            self._refresh()
+        self.root.after(20, self._pump)
+
+    def _on_status(self, ev):
+        radio = self.station.by_key(ev["radio"])
+        if radio is None:
+            return
+        radio.connected = ev["connected"]
+        if ev["connected"]:
+            self.router.prime(radio.key)
+            self.router.apply_tx()          # sätt split efter TX-VFO:n
+            self.audio.apply()
+        self._refresh_status()
+
+    def _refresh(self):
+        cache = self._cell_text
+        for key, lbl in self.cells.items():
+            rk, rxi, vfo = key
+            txt = fmt_freq(self.station.by_key(rk).rx[rxi].freq[vfo])
+            if cache.get(key) != txt:
+                cache[key] = txt
+                lbl.configure(text=txt)
+        self._refresh_spots()
+        self._refresh_markers()
+
+    def _refresh_spots(self):
+        now = time.time()
+        for rxi, lbl in self.spot_labels.items():
+            spot = self.last_spot.get(rxi)
+            if spot is not None and now - spot["ts"] >= SPOT_MAX_AGE_S:
+                del self.last_spot[rxi]
+                spot = None
+            if spot is None:
+                txt = ""
+            else:
+                age_min = int((now - spot["ts"]) // SPOT_AGE_STEP_S) * (SPOT_AGE_STEP_S // 60)
+                age_txt = "  · %d min" % age_min if age_min > 0 else ""
+                txt = "[%s] %s  %s%s" % (spot["rule_name"], fmt_freq(spot["freq_hz"]),
+                                         spot["call"], age_txt)
+            if self._cell_text.get(("spot", rxi)) != txt:
+                self._cell_text[("spot", rxi)] = txt
+                lbl.configure(text=txt)
+
+    def _refresh_markers(self):
+        st = self.station
+        ear_key = self._key(st.ear)
+        tx_key = self._key(st.tx)
+        enc = st.encoder_on
+        tx_tuning = st.tx_radio().tune
+        audible = set(self._key(c) for c in st.audible_cells())
+        inv = self._c_inv
+        for key, outer in self.cellouter.items():
+            inner = self.cellinner[key]
+            # öra-ring (yttre) — configure bara vid ändrad färg
+            if key == ear_key:
+                obc = self._c_green_b if enc == "ear" else self._c_green
+            else:
+                obc = inv
+            if self._outer_bc.get(key) != obc:
+                self._outer_bc[key] = obc
+                outer.configure(border_color=obc)
+            # TX-ring (inre) + hörs-nu-fyllning — batcha till ett configure
+            if key == tx_key:
+                ibc = self._c_txred if tx_tuning else (
+                    self._c_orange_b if enc == "tx" else self._c_orange)
+            else:
+                ibc = inv
+            ifg = self._c_heard if key in audible else inv
+            changed = {}
+            if self._inner_bc.get(key) != ibc:
+                self._inner_bc[key] = ibc
+                changed["border_color"] = ibc
+            if self._inner_fg.get(key) != ifg:
+                self._inner_fg[key] = ifg
+                changed["fg_color"] = ifg
+            if changed:
+                inner.configure(**changed)
+        self._refresh_status()
+
+    def _refresh_status(self):
+        # Statusraden borttagen (redundant): anslutning visas av panelprickarna,
+        # encoder öra/TX av den ljusare ringen, hör-läge av "hörs nu"-fyllningen.
+        for dot, rk in self.dots:
+            col = self._c_conn if self.station.by_key(rk).connected else self._c_disc
+            if self._dot_col.get(dot) != col:
+                self._dot_col[dot] = col
+                dot.configure(text_color=col)
+
+    # ----- ramlöst fönster: drag + avsluta-meny --------------------------------
+    def _bind_drag(self, widget):
+        # Endast i ramlöst normalläge. Tweak-läget behåller OS-ramen och flyttas
+        # med den vanliga titelraden, så body-drag vore bara förvirrande där.
+        if self.tweak:
+            return
+        widget.bind("<Button-1>", self._on_press)
+        widget.bind("<B1-Motion>", self._on_drag)
+        widget.bind("<ButtonRelease-1>", self._on_release)
+        widget.bind("<Button-3>", self._on_win_menu)
+
+    def _on_press(self, event):
+        self._drag_origin = (event.x_root, event.y_root)
+        self._win_origin = (self.root.winfo_x(), self.root.winfo_y())
+        self._moved = False
+
+    def _on_drag(self, event):
+        dx = event.x_root - self._drag_origin[0]
+        dy = event.y_root - self._drag_origin[1]
+        if abs(dx) > 5 or abs(dy) > 5:
+            self._moved = True
+        if self._moved:
+            x = self._win_origin[0] + dx
+            y = self._win_origin[1] + dy
+            x, y = win_snap.snap(self.root.title(), x, y,
+                                  self.root.winfo_width(), self.root.winfo_height())
+            self.root.geometry("+%d+%d" % (x, y))
+
+    def _on_release(self, event):
+        if self._moved:
+            d = load_settings()
+            d["x"] = self.root.winfo_x()
+            d["y"] = self.root.winfo_y()
+            save_settings(d)
+
+    def _on_win_menu(self, event):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="CW-inställningar...", command=self._open_cw_settings)
+        menu.add_command(label="Avsluta", command=self._on_close)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _open_cw_settings(self):
+        """Liveinställningar för keyer/sidoton (dot/dash/gap/pitch/ramp). 'Tillämpa'
+        ändrar direkt i router.keyer/router.sidetone (inget omstartskrav, för att
+        kunna modelleras); 'Spara' skriver dessutom till tcisync_settings.json så
+        värdena finns kvar till nästa start."""
+        if getattr(self, "_cw_win", None) is not None and self._cw_win.winfo_exists():
+            self._cw_win.lift()
+            return
+        keyer, sidetone = self.router.keyer, self.router.sidetone
+        win = ctk.CTkToplevel(self.root)
+        win.title("CW-inställningar")
+        win.attributes("-topmost", True)
+        self._cw_win = win
+
+        fields = [
+            ("Pitch (Hz)", "pitch_hz", sidetone.freq_hz),
+            ("Ramp (ms)", "ramp_ms", sidetone.ramp_ms),
+            ("Dot (%)", "dot_pct", keyer.dot_pct),
+            ("Dash (%)", "dash_pct", keyer.dash_pct),
+            ("Gap (%)", "gap_pct", keyer.gap_pct),
+            ("Debounce (ms)", "debounce_ms", keyer.debounce_ms),
+            ("Break-in (ms)", "break_in_ms", keyer.break_in_ms),
+            ("Ptt-CW delay (ms)", "ptt_cw_delay_ms", keyer.ptt_cw_delay_ms),
+        ]
+        entries = {}
+        for i, (label, key, val) in enumerate(fields):
+            ctk.CTkLabel(win, text=label).grid(row=i, column=0, padx=8, pady=4, sticky="w")
+            e = ctk.CTkEntry(win, width=80)
+            e.insert(0, str(val))
+            e.grid(row=i, column=1, padx=8, pady=4)
+            entries[key] = e
+
+        def read_values():
+            try:
+                return {k: int(float(e.get())) for k, e in entries.items()}
+            except ValueError:
+                self._log("CW-inställningar: ogiltigt värde, inget ändrat")
+                return None
+
+        def apply_live():
+            vals = read_values()
+            if vals is None:
+                return
+            sidetone.reconfigure(freq_hz=vals["pitch_hz"], ramp_ms=vals["ramp_ms"])
+            keyer.dot_pct = vals["dot_pct"]
+            keyer.dash_pct = vals["dash_pct"]
+            keyer.gap_pct = vals["gap_pct"]
+            keyer.debounce_ms = vals["debounce_ms"]
+            keyer.break_in_ms = vals["break_in_ms"]
+            keyer.ptt_cw_delay_ms = vals["ptt_cw_delay_ms"]
+            self._log("CW-inställningar: tillämpade (live)")
+            return vals
+
+        def do_save():
+            vals = apply_live()
+            if vals is None:
+                return
+            d = load_settings()
+            d["cw"] = vals
+            save_settings(d)
+            self._log("CW-inställningar: sparade till tcisync_settings.json")
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.grid(row=len(fields), column=0, columnspan=2, pady=(6, 8))
+        ctk.CTkButton(btns, text="Tillämpa", width=90, command=apply_live).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Spara", width=90, command=do_save).pack(side="left", padx=4)
+
+    def _on_close(self):
+        self.stop_flag.set()
+        self.router.stop()
+        self.spot_feed.stop()
+        for link in self.links.values():
+            link.stop()
+        if self.hid:
+            try:
+                self.hid.close()
+            except Exception:
+                pass
+        self.root.destroy()
+
+
+def main():
+    tweak = "--tweak" in sys.argv[1:]
+    th.setup()
+    root = ctk.CTk()
+    Cockpit(root, tweak=tweak)
+    root.update_idletasks()               # låt widgetarna räkna ut sina begärda storlekar
+    if tweak:
+        root.geometry("680x400")
+        root.minsize(520, 370)
+    else:
+        # Ramlöst (som rotor): ingen OS-titelrad. Flytta med body-drag, avsluta via
+        # högerklicksmenyn. Auto-anpassa fönstret till innehållets faktiska storlek:
+        # tunn stripa utan svart yta och utan klippning, oavsett trimmade cell-/textmått.
+        root.overrideredirect(True)
+        w = root.winfo_reqwidth()
+        h = 153                           # samma höjd som rotorfönstret (kompass-storleken)
+        cfg = load_settings()
+        if "x" in cfg and "y" in cfg:
+            root.geometry("%dx%d+%d+%d" % (w, h, cfg["x"], cfg["y"]))
+        else:
+            root.geometry("%dx%d" % (w, h))
+        root.minsize(w, h)
+        root.attributes("-topmost", True)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

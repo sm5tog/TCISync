@@ -1,0 +1,125 @@
+{
+  "device": {
+    "vid": "0x1FC9",
+    "pid": "0x0003",
+    "input_length": 18
+  },
+  "controls": {
+    "zoom_up": {
+      "type": "button",
+      "byte": 2,
+      "mask": 2
+    },
+    "split": {
+      "type": "button",
+      "byte": 2,
+      "mask": 4
+    },
+    "switch_rx": {
+      "type": "button",
+      "byte": 2,
+      "mask": 8
+    },
+    "rit_reset": {
+      "type": "button",
+      "byte": 2,
+      "mask": 16
+    },
+    "listen_ab": {
+      "type": "button",
+      "byte": 2,
+      "mask": 32
+    },
+    "zoom_down": {
+      "type": "button",
+      "byte": 2,
+      "mask": 64
+    },
+    "step_down": {
+      "type": "button",
+      "byte": 2,
+      "mask": 128
+    },
+    "step_up": {
+      "type": "button",
+      "byte": 3,
+      "mask": 1
+    },
+    "if_as_rit": {
+      "type": "button",
+      "byte": 3,
+      "mask": 2
+    },
+    "listen_a": {
+      "type": "button",
+      "byte": 3,
+      "mask": 4
+    },
+    "listen_b": {
+      "type": "button",
+      "byte": 3,
+      "mask": 16
+    },
+    "vfob_onoff": {
+      "type": "button",
+      "byte": 3,
+      "mask": 64
+    },
+    "tune": {
+      "type": "button",
+      "byte": 3,
+      "mask": 8
+    },
+    "change_vfo": {
+      "type": "button",
+      "byte": 3,
+      "mask": 32
+    },
+    "vfo_main": {
+      "type": "encoder",
+      "byte": 14
+    },
+    "knob_left": {
+      "type": "encoder",
+      "byte": 15
+    },
+    "knob_center": {
+      "type": "encoder",
+      "byte": 16
+    },
+    "knob_right": {
+      "type": "encoder",
+      "byte": 17
+    },
+    "custom_vred_v_tryck": {
+      "type": "button",
+      "byte": 4,
+      "mask": 1
+    },
+    "custom_vred_m_tryck": {
+      "type": "button",
+      "byte": 4,
+      "mask": 2
+    },
+    "custom_vred_h_tryck": {
+      "type": "button",
+      "byte": 4,
+      "mask": 4
+    },
+    "cw_dit": {
+      "type": "button",
+      "byte": 4,
+      "mask": 32
+    },
+    "cw_dah": {
+      "type": "button",
+      "byte": 4,
+      "mask": 16
+    },
+    "ptt_pedal": {
+      "type": "button",
+      "byte": 4,
+      "mask": 8
+    }
+  }
+}

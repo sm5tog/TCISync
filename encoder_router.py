@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""encoder_router.py - SunSync controller: E-Coder-panel + mus -> öra/TX-modellen.
+
+Mus-modellen (DESIGN §9). Två markörer sätts med musen: vänsterklick = öra, höger-
+klick = TX. Encodern stämmer den ena (öra/TX), knapp 13 växlar vilken. Knapp 14
+togglar tillfällig TX-lyssning, knapp 12 dess läge (TX / TX+RX). Övrig panelstyrning
+(TUNE, CW-makron, split, WPM/DRIVE/RIT) riktas mot rätt radio.
+
+Knappnumrering (fysisk, live-kartlagd 2026-07-26) -> roll:
+   1 zoom_up      CW "SM5K"        8  step_up     (ledig)
+   2 split        (ledig)          9  if_as_rit   (ledig)
+   3 switch_rx    TUNE (TX-radio)  10 listen_a    (ledig)
+   4 rit_reset    (ledig)          11 tune        CW "TU"
+   5 listen_ab    (ledig)          12 listen_b    toggla listen_both
+   6 zoom_down    CW "UR 5NN"      13 change_vfo  växla encoder öra/TX
+   7 step_down    (ledig)          14 vfob_onoff  toggla listen_tx
+
+Två riktningar med eko-spärr: handle_panel/flush (panel -> TCI + modell) och
+handle_tci (TCI -> modell).
+"""
+
+import time
+
+from cw_keyer import IambicKeyer
+from sidetone import Sidetone
+
+# --- VFO-varvtalsacceleration (porterad ur ecoder_control) ---------------------
+BASE_STEP = 1
+ACCEL_N0 = 3.0
+ACCEL_SCALE = 6.0
+ACCEL_EXP = 2.0
+ACCEL_PER_MAX = 2000
+
+DRIVE_STEP = 1
+RIT_STEP = 10
+WPM_STEP = 1
+WPM_MIN = 10
+WPM_MAX = 50
+WPM_PRESET = 20
+ECHO_WINDOW = 0.8
+
+MACROS = {
+    "zoom_up": "SM5K",       # knapp 1
+    "zoom_down": "UR 5NN",   # knapp 6
+    "tune": "TU",            # knapp 11
+}
+
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+class EncoderRouter:
+    def __init__(self, station, links, log=None, cw_settings=None):
+        """cw_settings (valfri dict) -> pitch_hz/ramp_ms (Sidetone) och
+        dot_pct/dash_pct/gap_pct (IambicKeyer), se cw_keyer.DEFAULT_CW_SETTINGS
+        och sunsync.py:s inläsning från sunsync_settings.json (nyckel "cw")."""
+        self.station = station
+        self.links = links
+        self._log = log or (lambda _t: None)
+        self._acc = {"vfo_main": 0, "knob_left": 0, "knob_center": 0, "knob_right": 0}
+        self._ts = {}
+        self._mon_volume = {}   # radio_key -> senast kända MON_VOLUME (dB), från prime()/eko
+        self._mon_restore = {}  # radio_key -> nivå att återställa till efter nyckling
+        cw = cw_settings or {}
+        self.sidetone = Sidetone(
+            freq_hz=cw.get("pitch_hz", 700),
+            ramp_ms=cw.get("ramp_ms", 7))
+        self.keyer = IambicKeyer(
+            get_wpm=lambda: self.station.tx_radio().wpm,
+            send_keyer=self._send_keyer,
+            send_trx=self._send_keyer_trx,
+            sidetone=self.sidetone,
+            log=self._log,
+            dot_pct=cw.get("dot_pct"),
+            dash_pct=cw.get("dash_pct"),
+            gap_pct=cw.get("gap_pct"),
+            debounce_ms=cw.get("debounce_ms"),
+            break_in_ms=cw.get("break_in_ms"),
+            ptt_cw_delay_ms=cw.get("ptt_cw_delay_ms"))
+
+    def stop(self):
+        self.keyer.stop()
+        self.sidetone.stop()
+
+    def _send(self, radio_key, cmd):
+        link = self.links.get(radio_key)
+        if link is not None:
+            link.send(cmd)
+
+    # ----- eko-spärr -----------------------------------------------------------
+    def _guard(self, tag):
+        self._ts[tag] = time.time()
+
+    def _echoed(self, tag, known):
+        return known is not None and time.time() - self._ts.get(tag, 0) < ECHO_WINDOW
+
+    # ----- panel in ------------------------------------------------------------
+    def handle_panel(self, key, kind, value):
+        if kind == "turn":
+            if key in self._acc:
+                self._acc[key] += value
+            return False
+        if key == "cw_dit":                    # manipulator, kort kontakt (byte 4, mask 0x20)
+            if kind in ("press", "release"):
+                self.keyer.set_dit(kind == "press")
+            return False
+        if key == "cw_dah":                    # manipulator, lång kontakt (byte 4, mask 0x10)
+            if kind in ("press", "release"):
+                self.keyer.set_dah(kind == "press")
+            return False
+        if key == "ptt_pedal":                 # PTT-fotpedal (byte 4, mask 0x08)
+            if kind in ("press", "release"):
+                return self._ptt(kind == "press")
+            return False
+        if kind != "press":
+            return False
+        return self._press(key)
+
+    def _send_keyer(self, state, duration_ms):
+        """Skickar TCI KEYER:rx,state,duration; till TX-radion åt IambicKeyer.
+        duration_ms är 0 vid nedtryck, uppmätt elementlängd vid släpp (se
+        cw_keyer.py och tci_protocol.txt om KEYER-kommandots jitterkompensation)."""
+        radio = self.station.tx_radio()
+        rxi = self.station.tx[1]
+        self._send(radio.key, "KEYER:%d,%s,%d;" % (rxi, "true" if state else "false", duration_ms))
+
+    def _send_keyer_trx(self, state):
+        """Drar den RIKTIGA PTT/TX-motorn (inklusive interlock mot andra radion)
+        åt IambicKeyer. KEYER ensamt sätter bara TCI-statusflaggan/TX-lampan hos
+        ExpertSDR3, inte den riktiga sändningskedjan - upptäckt via TCI-loggen
+        2026-08-03 (KEYER-nyckling saknade tx_enable-interlocket som ett riktigt
+        makro/TRX-anrop har)."""
+        radio = self.station.tx_radio()
+        rxi = self.station.tx[1]
+        self._send(radio.key, "TRX:%d,%s;" % (rxi, "true" if state else "false"))
+        # Radions egen TX-medhörning (MON_VOLUME) tystas under manuell manipulator-
+        # nyckling - annars hörs både radions nätverksfördröjda medhörning och vår
+        # lokala sidoton samtidigt, förvirrande. MON_ENABLE visade sig INTE tysta
+        # ljudet på riktigt (TCI-loggen 2026-08-03 visade att den ekades korrekt men
+        # utan hörbar effekt), medan MON_VOLUME gör det (verifierat manuellt av Jonny,
+        # -60 = tyst). Nivån minns vi innan vi sänker, och återställer EXAKT samma
+        # nivå efteråt istället för att bara slå på igen på en okänd/förvald nivå.
+        if state:
+            self._mon_restore[radio.key] = self._mon_volume.get(radio.key, 0)
+            self._guard(("monvol", radio.key))
+            self._send(radio.key, "MON_VOLUME:-60;")
+        else:
+            restore = self._mon_restore.pop(radio.key, 0)
+            self._guard(("monvol", radio.key))
+            self._send(radio.key, "MON_VOLUME:%g;" % restore)
+
+    def _ptt(self, on):
+        """PTT-pedal (byte 4, mask 0x08) -> TRX-kommando till TX-radion, härlett
+        ur station.tx (DESIGN.md §1/§4 steg 4). Foljer TX-valet dynamiskt istallet
+        for att vara hardwired mot en enda radio."""
+        radio = self.station.tx_radio()
+        rxi = self.station.tx[1]
+        self._send(radio.key, "TRX:%d,%s;" % (rxi, "true" if on else "false"))
+        self._log("PTT %s (%s RX%d)" % ("PÅ" if on else "av", radio.name, rxi + 1))
+        return False
+
+    def _press(self, key):
+        if key == "change_vfo":              # 13: växla encoder öra/TX
+            self.station.encoder_on = "tx" if self.station.encoder_on == "ear" else "ear"
+            self._log("Encoder: %s" % ("TX" if self.station.encoder_on == "tx" else "Öra"))
+            return True
+        if key == "vfob_onoff":              # 14: toggla tillfällig TX-lyssning
+            self.station.listen_tx = not self.station.listen_tx
+            self._log("Lyssnar på %s" % ("TX" if self.station.listen_tx else "hemma"))
+            return True
+        if key == "listen_b":                # 12: toggla listen_both-läget
+            self.station.listen_both = not self.station.listen_both
+            self._log("TX-lyssning: %s" % ("TX + RX" if self.station.listen_both else "TX endast"))
+            return True
+        if key == "switch_rx":               # 3: TUNE (sänder på TX-radion)
+            return self._toggle_tune()
+        if key in MACROS:                    # 1/6/11: CW-makro på TX-radion
+            self._send_macro(key)
+            return False
+        if key == "custom_vred_v_tryck":     # WPM-vred-tryck -> 20 WPM
+            return self._set_wpm(WPM_PRESET)
+        if key == "custom_vred_h_tryck":     # RIT-vred-tryck -> RIT på/av (öra-RX)
+            return self._toggle_rit_enable()
+        # Lediga: split(2), rit_reset(4), listen_ab(5), step_down(7), step_up(8),
+        # if_as_rit(9), listen_a(10), custom_vred_m_tryck. (SPLIT sätts nu av TX-VFO:n.)
+        self._log("(ledig) %s" % key)
+        return False
+
+    def flush(self):
+        dirty = False
+        a = self._acc
+        if a["vfo_main"]:
+            dirty |= self._tune(a["vfo_main"])
+        if a["knob_left"]:
+            dirty |= self._adj_wpm(a["knob_left"])
+        if a["knob_center"]:
+            dirty |= self._adj_drive(a["knob_center"])
+        if a["knob_right"]:
+            dirty |= self._adj_rit(a["knob_right"])
+        for k in a:
+            a[k] = 0
+        return dirty
+
+    # ----- mus (öra/TX-placering) ----------------------------------------------
+    def set_ear(self, cell):
+        """Vänsterklick: sätt örats hemvist till cellen (radio_idx, rx_idx, vfo)."""
+        if not self._valid(cell):
+            return False
+        self.station.ear = cell
+        self._log("Öra: %s" % self._cellname(cell))
+        return True
+
+    def set_tx(self, cell):
+        """Högerklick: sätt TX till cellen. TX-säkerhet: byter vi TX-mottagare (radio
+        eller RX1<->RX2 på samma radio), städa den vi lämnar: slå av dess TUNE (på det
+        gamla transceiver-indexet) så bara en mottagare kan sända, och slå av dess split
+        så split bara ligger kvar på den RX som faktiskt är TX. Sätter sedan split efter
+        nya TX-VFO:n (VFO B = split på, radion nycklar på B)."""
+        if not self._valid(cell):
+            return False
+        old = self.station.tx
+        if (cell[0], cell[1]) != (old[0], old[1]):
+            old_radio = self.station.radios[old[0]]
+            old_rx = old_radio.rx[old[1]]
+            if old_radio.tune:
+                old_radio.tune = False
+                self._send(old_radio.key, "TUNE:%d,false;" % old[1])
+                self._log("TUNE av på %s RX%d (TX flyttad)" % (old_radio.name, old[1] + 1))
+            if old_rx.split:
+                old_rx.split = False
+                self._send(old_radio.key, "SPLIT_ENABLE:%d,false;" % old[1])
+                self._log("Split av på %s RX%d (TX flyttad)" % (old_radio.name, old[1] + 1))
+        self.station.tx = cell
+        self.apply_tx()
+        self._log("TX: %s" % self._cellname(cell))
+        return True
+
+    def apply_tx(self):
+        """Sätt sändnings-VFO på TX-mottagaren via SPLIT_ENABLE. arg1 = transceiver-index,
+        som på SunSDR2DX är mottagar-index (transceiver 0 = RX1, 1 = RX2). TX på VFO B ->
+        split på, TX på VFO A -> split av. Idempotent (körs vid TX-byte och anslutning).
+
+        Vid av->på-övergången flyttar ExpertSDR3 själv VFO B till VFO A + offset (1 kHz CW
+        / 5 kHz SSB). Vi bokför VFO B före split och återställer den direkt efteråt så
+        operatörens satta TX-frekvens bevaras. Eko-spärr gör att radions auto-hopp-eko
+        ignoreras (ingen flimmer i displayen)."""
+        radio = self.station.tx_radio()
+        rxi = self.station.tx[1]
+        rx = radio.rx[rxi]
+        want = self.station.tx[2] == 1
+        was = rx.split
+        rx.split = want
+        if want and not was:
+            stored = rx.freq[1]
+            self._send(radio.key, "SPLIT_ENABLE:%d,true;" % rxi)
+            if stored is not None:
+                self._guard(("vfo", radio.key, rxi, 1))
+                self._send(radio.key, "VFO:%d,1,%d;" % (rxi, stored))
+                rx.freq[1] = stored
+        else:
+            self._send(radio.key, "SPLIT_ENABLE:%d,%s;" % (rxi, "true" if want else "false"))
+
+    def _valid(self, cell):
+        ri, rxi, vfo = cell
+        return 0 <= ri < len(self.station.radios) and rxi < self.station.radios[ri].rx_count \
+            and vfo in (0, 1)
+
+    def _cellname(self, cell):
+        r = self.station.radios[cell[0]]
+        return "%s RX%d VFO %s" % (r.name, cell[1] + 1, "AB"[cell[2]])
+
+    # ----- utgående ------------------------------------------------------------
+    def _step_per_detent(self, n):
+        if n <= ACCEL_N0:
+            return 1.0
+        return 1.0 + ((n - ACCEL_N0) / ACCEL_SCALE) ** ACCEL_EXP
+
+    def _tune(self, delta):
+        """Stäm den cell encodern står på (öra eller TX)."""
+        ri, rxi, vfo = self.station.encoder_cell()
+        radio = self.station.radios[ri]
+        rx = radio.rx[rxi]
+        base = rx.freq[vfo]
+        if base is None:
+            return False
+        n = abs(delta)
+        sign = 1 if delta > 0 else -1
+        per = min(BASE_STEP * self._step_per_detent(n), ACCEL_PER_MAX)
+        new = int(base) + sign * int(round(n * per))
+        rx.freq[vfo] = new
+        self._guard(("vfo", radio.key, rxi, vfo))
+        self._send(radio.key, "VFO:%d,%d,%d;" % (rxi, vfo, new))
+        return True
+
+    def _adj_wpm(self, delta):
+        radio = self.station.tx_radio()
+        cur = radio.wpm if radio.wpm is not None else 25
+        radio.wpm = clamp(int(cur) + delta * WPM_STEP, WPM_MIN, WPM_MAX)
+        self._guard(("wpm", radio.key))
+        self._send(radio.key, "CW_KEYER_SPEED:%d;" % radio.wpm)
+        self._send(radio.key, "CW_MACROS_SPEED:%d;" % radio.wpm)
+        return True
+
+    def _set_wpm(self, value):
+        radio = self.station.tx_radio()
+        radio.wpm = value
+        self._guard(("wpm", radio.key))
+        self._send(radio.key, "CW_KEYER_SPEED:%d;" % value)
+        self._send(radio.key, "CW_MACROS_SPEED:%d;" % value)
+        self._log("WPM = %d" % value)
+        return True
+
+    def _adj_drive(self, delta):
+        radio = self.station.tx_radio()
+        if radio.drive is None:
+            return False
+        radio.drive = clamp(int(radio.drive) + delta * DRIVE_STEP, 0, 100)
+        self._guard(("drive", radio.key))
+        self._send(radio.key, "DRIVE:%d,%d;" % (self.station.tx[1], radio.drive))
+        return True
+
+    def _adj_rit(self, delta):
+        ri, rxi, _ = self.station.ear
+        radio = self.station.radios[ri]
+        rx = radio.rx[rxi]
+        cur = rx.rit_offset or 0
+        rx.rit_offset = int(cur) + delta * RIT_STEP
+        self._guard(("rit", radio.key, rxi))
+        self._send(radio.key, "RIT_OFFSET:%d,%d;" % (rxi, rx.rit_offset))
+        return True
+
+    def _send_macro(self, key):
+        radio = self.station.tx_radio()
+        text = MACROS[key]
+        self._send(radio.key, "CW_MACROS:%d,%s;" % (self.station.tx[1], text))
+        self._log("CW: %s (sänder på %s RX%d)" % (text, radio.name, self.station.tx[1] + 1))
+
+    def _toggle_tune(self):
+        radio = self.station.tx_radio()
+        rxi = self.station.tx[1]
+        radio.tune = not radio.tune
+        self._send(radio.key, "TUNE:%d,%s;" % (rxi, "true" if radio.tune else "false"))
+        self._log("TUNE %s%s" % ("PÅ" if radio.tune else "av",
+                                 " - %s RX%d SÄNDER" % (radio.name, rxi + 1) if radio.tune else ""))
+        return True
+
+    def _toggle_rit_enable(self):
+        ri, rxi, _ = self.station.ear
+        radio = self.station.radios[ri]
+        rx = radio.rx[rxi]
+        rx.rit_on = not rx.rit_on
+        self._send(radio.key, "RIT_ENABLE:%d,%s;" % (rxi, "true" if rx.rit_on else "false"))
+        return True
+
+    # ----- prime (fråga radion vid anslutning) ---------------------------------
+    def prime(self, radio_key):
+        radio = self.station.by_key(radio_key)
+        if radio is None:
+            return
+        cmds = ["CW_KEYER_SPEED;", "CW_MACROS_SPEED;", "MON_VOLUME;"]
+        for rxi in range(radio.rx_count):
+            cmds += ["VFO:%d,0;" % rxi, "VFO:%d,1;" % rxi,
+                     "RIT_OFFSET:%d;" % rxi, "RIT_ENABLE:%d;" % rxi,
+                     "RX_CHANNEL_ENABLE:%d,1;" % rxi,
+                     "DRIVE:%d;" % rxi, "TUNE:%d;" % rxi, "SPLIT_ENABLE:%d;" % rxi]
+        for c in cmds:
+            self._send(radio_key, c)
+
+    # ----- inkommande TCI (modell + eko-spärr) ---------------------------------
+    def handle_tci(self, ev):
+        radio = self.station.by_key(ev["radio"])
+        if radio is None or ev.get("kind") != "cmd":
+            return False
+        name, args = ev["name"], ev["args"]
+        try:
+            if name == "VFO" and len(args) >= 3 and args[0] in ("0", "1") and args[1] in ("0", "1"):
+                rxi, vfo = int(args[0]), int(args[1])
+                if rxi < radio.rx_count and not self._echoed(
+                        ("vfo", radio.key, rxi, vfo), radio.rx[rxi].freq[vfo]):
+                    radio.rx[rxi].freq[vfo] = int(args[2])
+                    return True
+            elif name in ("CW_KEYER_SPEED", "CW_MACROS_SPEED") and len(args) >= 1:
+                if not self._echoed(("wpm", radio.key), radio.wpm):
+                    radio.wpm = int(float(args[0]))
+                    return True
+            elif name == "MON_VOLUME" and len(args) >= 1:
+                if not self._echoed(("monvol", radio.key), self._mon_volume.get(radio.key)):
+                    self._mon_volume[radio.key] = float(args[0])
+                    return True
+            elif name == "DRIVE" and len(args) >= 2 and args[0] in ("0", "1"):
+                if not self._echoed(("drive", radio.key), radio.drive):
+                    radio.drive = int(float(args[1]))
+                    return True
+            elif name == "RIT_OFFSET" and len(args) >= 2 and args[0] in ("0", "1"):
+                rxi = int(args[0])
+                if rxi < radio.rx_count and not self._echoed(
+                        ("rit", radio.key, rxi), radio.rx[rxi].rit_offset):
+                    radio.rx[rxi].rit_offset = int(float(args[1]))
+                    return True
+            elif name == "RIT_ENABLE" and len(args) >= 2 and args[0] in ("0", "1"):
+                rxi = int(args[0])
+                if rxi < radio.rx_count:
+                    radio.rx[rxi].rit_on = args[1].lower() == "true"
+                    return True
+            elif name == "SPLIT_ENABLE" and len(args) >= 2 and args[0] in ("0", "1"):
+                rxi = int(args[0])
+                if rxi < radio.rx_count:
+                    radio.rx[rxi].split = args[1].lower() == "true"  # per mottagare
+                    return True
+            elif name == "RX_CHANNEL_ENABLE" and len(args) >= 3 and args[0] in ("0", "1") and args[1] == "1":
+                rxi = int(args[0])
+                if rxi < radio.rx_count:
+                    radio.rx[rxi].vfob_on = args[2].lower() == "true"
+                    return True
+            elif name == "TUNE" and len(args) >= 2 and args[0] in ("0", "1"):
+                radio.tune = args[1].lower() == "true"
+                return True
+        except (ValueError, IndexError, KeyError):
+            return False
+        return False
