@@ -21,6 +21,15 @@ Relevanta nycklar:
                                      för remote_-filer)
     Gui.TCI.open                 -> true om TCI-servern är påslagen
     Gui.TCI.port                 -> TCI-porten (alltid 127.0.0.1 lokalt)
+    Gui.SoundCard.output         -> ljudenheten ExpertSDR3 SJÄLV spelar upp
+                                     ljud på (t.ex. "MME: Hörlurar på
+                                     headset (...)") - används för att låta
+                                     vår egen sidoton hamna på SAMMA enhet
+                                     som ESDR3 använder, i stället för att
+                                     gissa via Windows systemstandard.
+                                     `line_out_*`-fälten i GlobalProfile_ är
+                                     separata, ofta avstängda hjälputgångar
+                                     (extern mixer m.m.) - inte samma sak.
 """
 
 import glob
@@ -34,14 +43,24 @@ PROFILE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", ""),
                             "Expert Electronics", "ExpertSDR3")
 
 
+def _strip_hostapi_prefix(name):
+    """'MME: Hörlurar på headset (...)' -> 'Hörlurar på headset (...)' -
+    profilens namn har ett API-prefix vi inte bryr oss om vid matchning
+    (vi letar upp enheten på valfri hostapi i sidetone.py)."""
+    if name and ":" in name:
+        return name.split(":", 1)[1].strip()
+    return name
+
+
 class DiscoveredRadio:
-    def __init__(self, serial, role, port, transceivers, mtime, path):
+    def __init__(self, serial, role, port, transceivers, mtime, path, sound_output=None):
         self.serial = serial      # utan "remote_"-prefix
         self.role = role          # "local" eller "remote"
         self.port = port
         self.transceivers = transceivers
         self.mtime = mtime
         self.path = path
+        self.sound_output = sound_output   # Gui.SoundCard.output, API-prefix borttaget
 
     def __repr__(self):
         return "DiscoveredRadio(serial=%r, role=%r, port=%r, transceivers=%r)" % (
@@ -76,8 +95,10 @@ def discover(profile_dir=PROFILE_DIR):
         if port is None:
             continue
         transceivers = data.get("GlobalProfile_", {}).get("transceivers", 1)
+        sound_output = _strip_hostapi_prefix(
+            data.get("Gui", {}).get("SoundCard", {}).get("output"))
         found.append(DiscoveredRadio(serial, role, int(port), int(transceivers),
-                                      os.path.getmtime(path), path))
+                                      os.path.getmtime(path), path, sound_output))
     # "open" i profilen uppdateras inte till false vid frånkoppling, den ligger
     # kvar från senaste gången just den filen begagnades - så samma serienummer
     # kan dyka upp i BÅDA rollerna om enheten någon gång körts både lokalt och
@@ -88,6 +109,18 @@ def discover(profile_dir=PROFILE_DIR):
         if cur is None or r.mtime > cur.mtime:
             best[r.serial] = r
     return list(best.values())
+
+
+def local_sound_output_name(discovered=None):
+    """Namnet på ljudenheten den LOKALA ExpertSDR3-instansen spelar upp på
+    (för att låta sidotonen hamna på samma enhet), eller None om ingen lokal
+    radio hittades/profilen saknade fältet."""
+    if discovered is None:
+        discovered = discover()
+    for r in discovered:
+        if r.role == "local" and r.sound_output:
+            return r.sound_output
+    return None
 
 
 if __name__ == "__main__":

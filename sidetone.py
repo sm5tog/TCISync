@@ -38,27 +38,48 @@ BLOCKSIZE = 64        # ~1.45ms/block vid 44100Hz - PortAudios eget val (blocksi
                       # fördröjning mellan on()/off() och att ljudtråden märkte det
 
 
-def _low_latency_output_device():
-    """Windows standardutgång väljs ofta via MME (typisk latens 80-150ms).
-    Samma fysiska enhet finns oftast även listad under WASAPI (mycket lägre
-    latens) - leta upp den varianten av samma enhet i stället för att lita
-    på sd.default.device. Faller tillbaka på standardenheten om ingen
-    WASAPI-matchning hittas."""
+def _wasapi_output_matching(name_fragment):
+    """Letar upp en WASAPI-utgång vars namn innehåller name_fragment. None om
+    inget hittas eller name_fragment är tomt."""
+    if not name_fragment:
+        return None
     try:
-        default_idx = sd.default.device[1]
-        default_name = sd.query_devices(default_idx)["name"].split(" (")[0].strip()
         wasapi = next(h for h in sd.query_hostapis() if h["name"] == "Windows WASAPI")
+        frag = name_fragment.split(" (")[0].strip()
         for i in wasapi["devices"]:
             d = sd.query_devices(i)
-            if d["max_output_channels"] > 0 and default_name in d["name"]:
+            if d["max_output_channels"] > 0 and frag in d["name"]:
                 return i
     except Exception:
         pass
     return None
 
 
+def _low_latency_output_device(preferred_name=None):
+    """Väljer en låglatens-utgång (WASAPI i stället för Windows MME, typisk
+    latens 80-150ms) på RÄTT fysisk enhet.
+
+    Om `preferred_name` ges (namnet på enheten ExpertSDR3 SJÄLV spelar upp
+    på, från expertsdr3_discover.local_sound_output_name() - se
+    Gui.SoundCard.output i profilen) används den i första hand, så sidotonen
+    hamnar på samma enhet som radion oavsett vad Windows systemstandard råkar
+    stå på. Annars faller den tillbaka på att matcha Windows nuvarande
+    standardutgång mot dess WASAPI-variant (gamla beteendet)."""
+    dev = _wasapi_output_matching(preferred_name)
+    if dev is not None:
+        return dev
+    try:
+        default_idx = sd.default.device[1]
+        default_name = sd.query_devices(default_idx)["name"]
+        return _wasapi_output_matching(default_name)
+    except Exception:
+        return None
+
+
 class Sidetone:
-    def __init__(self, freq_hz=FREQ_HZ, ramp_ms=RAMP_MS):
+    def __init__(self, freq_hz=FREQ_HZ, ramp_ms=RAMP_MS, output_name=None):
+        """output_name -> se _low_latency_output_device(); None = matcha mot
+        Windows systemstandard i stället för ExpertSDR3:s konfigurerade utgång."""
         self.freq_hz = freq_hz
         self.ramp_ms = ramp_ms
         self._lock = threading.Lock()
@@ -66,7 +87,7 @@ class Sidetone:
         self._amp = 0.0
         self._target = 0.0
         self._stream = sd.OutputStream(
-            device=_low_latency_output_device(),
+            device=_low_latency_output_device(output_name),
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
             callback=self._callback, blocksize=BLOCKSIZE, latency="low")
         self._stream.start()

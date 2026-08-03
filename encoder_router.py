@@ -26,6 +26,19 @@ from cw_keyer import IambicKeyer
 from sidetone import Sidetone
 from panel_functions import DEFAULT_PANEL_MAP
 
+
+def _auto_sidetone_output_name():
+    """Läser vilken ljudenhet den LOKALA ExpertSDR3-instansen själv spelar
+    upp på (Gui.SoundCard.output i profilen), så sidotonen hamnar på samma
+    enhet oavsett vad Windows systemstandard råkar stå på. Faller tyst
+    tillbaka på None (sidetone.py matchar då mot systemstandarden i stället)
+    om ingen profil hittas eller något går fel."""
+    try:
+        from expertsdr3_discover import local_sound_output_name
+        return local_sound_output_name()
+    except Exception:
+        return None
+
 # --- VFO-varvtalsacceleration (porterad ur ecoder_control) ---------------------
 BASE_STEP = 1
 ACCEL_N0 = 3.0
@@ -63,9 +76,13 @@ class EncoderRouter:
         self._mon_volume = {}   # radio_key -> senast kända MON_VOLUME (dB), från prime()/eko
         self._mon_restore = {}  # radio_key -> nivå att återställa till efter nyckling
         cw = cw_settings or {}
+        output_name = cw.get("sidetone_output_name")
+        if output_name is None:
+            output_name = _auto_sidetone_output_name()
         self.sidetone = Sidetone(
             freq_hz=cw.get("pitch_hz", 700),
-            ramp_ms=cw.get("ramp_ms", 7))
+            ramp_ms=cw.get("ramp_ms", 7),
+            output_name=output_name)
         self.keyer = IambicKeyer(
             get_wpm=lambda: self.station.tx_radio().wpm,
             send_keyer=self._send_keyer,
