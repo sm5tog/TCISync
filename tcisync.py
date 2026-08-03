@@ -36,7 +36,7 @@ from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from spot_feed import SpotFeed
 
-VERSION = "0.5.2"
+VERSION = "0.6.0"
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(_BASE_DIR, "tcisync_settings.json")
@@ -679,14 +679,27 @@ class Cockpit:
         ctk.CTkButton(btns, text="Tillämpa", width=90, command=apply_live).pack(side="left", padx=4)
         ctk.CTkButton(btns, text="Spara", width=90, command=do_save).pack(side="left", padx=4)
 
+    # (rad, kolumn) för varje knapp i panelbilden - samma fysiska placering
+    # som ESDR3:s egen E-Coder-konfigurationsbild. Storvredet upptar den
+    # tomma mitten på rad 2-3, kol 1-2 (ingen knapp där).
+    _PANEL_POSITIONS = {
+        "zoom_up": (0, 0), "split": (0, 1), "switch_rx": (0, 2),
+        "rit_reset": (0, 3), "listen_ab": (0, 4),
+        "zoom_down": (1, 0), "step_down": (1, 1), "step_up": (1, 2),
+        "if_as_rit": (1, 3), "listen_a": (1, 4),
+        "tune": (2, 0), "listen_b": (2, 4),
+        "change_vfo": (3, 0), "vfob_onoff": (3, 4),
+    }
+
     def _open_panel_map(self):
-        """Grafisk knappmappning: en rad per fysisk E-Coder-knapp (samma 14
-        knappar + de tre vredtrycken som layouten i panel_functions.py),
-        en dropdown för funktion (TCISyncs egna, se FUNCTION_CATALOG - INTE
-        ExpertSDR3:s inbyggda funktioner, den panelen är avstängd i ESDR3) och
-        ett fritextfält för ev. parameter (t.ex. CW-makrots text, WPM-värdet).
-        'Tillämpa' ändrar direkt i router.panel_map (live); 'Spara' skriver
-        dessutom till tcisync_settings.json."""
+        """Grafisk knappmappning: en klickbar panelbild i samma fysiska layout
+        som ESDR3:s egen E-Coder-konfigurationsskärm. Klick på en knapp öppnar
+        en popup med en dropdown för funktion (TCISyncs egna, se
+        panel_functions.FUNCTION_CATALOG - INTE ESDR3:s inbyggda funktioner,
+        den panelen är avstängd i ESDR3) och ett fritextfält för ev. parameter
+        (t.ex. CW-makrots text, WPM-värdet). Ändringen tillämpas direkt i
+        router.panel_map (live) och sparas till tcisync_settings.json så fort
+        popupen stängs med "OK"."""
         if getattr(self, "_panel_win", None) is not None and self._panel_win.winfo_exists():
             self._panel_win.lift()
             return
@@ -697,64 +710,89 @@ class Cockpit:
         win.attributes("-topmost", True)
         self._panel_win = win
 
+        grid = ctk.CTkFrame(win, fg_color="transparent")
+        grid.pack(padx=12, pady=(12, 6))
+        knob_row = ctk.CTkFrame(win, fg_color="transparent")
+        knob_row.pack(padx=12, pady=(0, 12))
+
+        self._panel_buttons = {}   # key -> CTkButton (för att uppdatera etiketten efter val)
+
+        def label_for(key, name):
+            entry = self.router.panel_map.get(key, {"func": "unused"})
+            func = entry.get("func", "unused")
+            func_label = FUNCTION_CATALOG.get(func, FUNCTION_CATALOG["unused"])["label"]
+            return "%s\n%s" % (name, func_label)
+
+        def make_click(key, name):
+            return lambda: self._open_function_popup(key, name)
+
+        for num, key, name in BUTTON_LAYOUT:
+            r, c = self._PANEL_POSITIONS[key]
+            btn = ctk.CTkButton(grid, text=label_for(key, name), width=120, height=50,
+                                 font=self.f_status, command=make_click(key, name))
+            btn.grid(row=r, column=c, padx=4, pady=4)
+            self._panel_buttons[key] = btn
+
+        ctk.CTkLabel(knob_row, text="Vredtryck:", font=self.f_btn).pack(side="left", padx=(0, 8))
+        for key, name in KNOB_PRESS_LAYOUT:
+            btn = ctk.CTkButton(knob_row, text=label_for(key, name), width=140, height=40,
+                                 font=self.f_status, command=make_click(key, name))
+            btn.pack(side="left", padx=4)
+            self._panel_buttons[key] = btn
+
+    def _open_function_popup(self, key, name):
+        """Popup för EN knapp: dropdown (funktion) + fritextfält (parameter).
+        OK skriver till router.panel_map (live) OCH tcisync_settings.json
+        direkt, uppdaterar sedan panelknappens etikett."""
+        from panel_functions import FUNCTION_CATALOG
+
         func_ids = list(FUNCTION_CATALOG.keys())
         func_labels = [FUNCTION_CATALOG[f]["label"] for f in func_ids]
         label_to_id = dict(zip(func_labels, func_ids))
         id_to_label = dict(zip(func_ids, func_labels))
 
-        rows = [(str(num), key, name) for (num, key, name) in BUTTON_LAYOUT]
-        rows += [("V/M/H", key, name) for (key, name) in KNOB_PRESS_LAYOUT]
+        entry = self.router.panel_map.get(key, {"func": "unused"})
+        cur_func = entry.get("func", "unused")
+        cur_param = entry.get("param", "")
 
-        headers = ["Knapp", "ESDR3-namn (referens)", "Funktion", "Parameter"]
-        for c, h in enumerate(headers):
-            ctk.CTkLabel(win, text=h, font=self.f_btn).grid(row=0, column=c, padx=6, pady=(8, 2))
+        pop = ctk.CTkToplevel(self.root)
+        pop.title(name)
+        pop.attributes("-topmost", True)
+        pop.grab_set()
 
-        entries = {}   # key -> (StringVar, CTkEntry)
-        for i, (num, key, name) in enumerate(rows, start=1):
-            entry = self.router.panel_map.get(key, {"func": "unused"})
-            cur_func = entry.get("func", "unused")
-            cur_param = entry.get("param", "")
+        ctk.CTkLabel(pop, text=name, font=self.f_btn).grid(
+            row=0, column=0, columnspan=2, padx=10, pady=(10, 6))
+        ctk.CTkLabel(pop, text="Funktion").grid(row=1, column=0, padx=8, pady=4, sticky="w")
+        var = tk.StringVar(value=id_to_label.get(cur_func, id_to_label["unused"]))
+        ctk.CTkOptionMenu(pop, values=func_labels, variable=var, width=210).grid(
+            row=1, column=1, padx=8, pady=4)
+        ctk.CTkLabel(pop, text="Parameter").grid(row=2, column=0, padx=8, pady=4, sticky="w")
+        pentry = ctk.CTkEntry(pop, width=120)
+        if cur_param not in (None, ""):
+            pentry.insert(0, str(cur_param))
+        pentry.grid(row=2, column=1, padx=8, pady=4)
 
-            ctk.CTkLabel(win, text=num).grid(row=i, column=0, padx=6, pady=2)
-            ctk.CTkLabel(win, text=name).grid(row=i, column=1, padx=6, pady=2, sticky="w")
-
-            var = tk.StringVar(value=id_to_label.get(cur_func, id_to_label["unused"]))
-            ctk.CTkOptionMenu(win, values=func_labels, variable=var, width=210).grid(
-                row=i, column=2, padx=6, pady=2)
-
-            pentry = ctk.CTkEntry(win, width=100)
-            if cur_param not in (None, ""):
-                pentry.insert(0, str(cur_param))
-            pentry.grid(row=i, column=3, padx=6, pady=2)
-
-            entries[key] = (var, pentry)
-
-        def read_map():
-            result = {}
-            for key, (var, pentry) in entries.items():
-                func = label_to_id.get(var.get(), "unused")
-                item = {"func": func}
-                param_raw = pentry.get().strip()
-                if param_raw:
-                    item["param"] = param_raw
-                result[key] = item
-            return result
-
-        def apply_live():
-            self.router.panel_map = read_map()
-            self._log("Knappmappning: tillämpad (live)")
-
-        def do_save():
-            apply_live()
+        def on_ok():
+            func = label_to_id.get(var.get(), "unused")
+            item = {"func": func}
+            param_raw = pentry.get().strip()
+            if param_raw:
+                item["param"] = param_raw
+            self.router.panel_map[key] = item
             d = load_settings()
-            d["panel_map"] = self.router.panel_map
+            pm = d.get("panel_map", {})
+            pm[key] = item
+            d["panel_map"] = pm
             save_settings(d)
-            self._log("Knappmappning: sparad till tcisync_settings.json")
+            self._log("Knappmappning: %s -> %s" % (name, FUNCTION_CATALOG[func]["label"]))
+            self._panel_buttons[key].configure(
+                text="%s\n%s" % (name, FUNCTION_CATALOG[func]["label"]))
+            pop.destroy()
 
-        btns = ctk.CTkFrame(win, fg_color="transparent")
-        btns.grid(row=len(rows) + 1, column=0, columnspan=4, pady=(8, 10))
-        ctk.CTkButton(btns, text="Tillämpa", width=90, command=apply_live).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Spara", width=90, command=do_save).pack(side="left", padx=4)
+        btns = ctk.CTkFrame(pop, fg_color="transparent")
+        btns.grid(row=3, column=0, columnspan=2, pady=(6, 10))
+        ctk.CTkButton(btns, text="OK", width=90, command=on_ok).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Avbryt", width=90, command=pop.destroy).pack(side="left", padx=4)
 
     def _on_close(self):
         self.stop_flag.set()
