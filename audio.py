@@ -46,9 +46,11 @@ class AudioSwitch:
                 if rx.index in rxs_here:
                     self._send(radio.key, "RX_MUTE:%d,false;" % rx.index)
                     vfos = {v for (r, rxi, v) in audible if r == ri and rxi == rx.index}
-                    if 1 in vfos:
-                        # VFO B hörs bara om dess kanal är aktiverad (VFO A är alltid på).
-                        self._send(radio.key, "RX_CHANNEL_ENABLE:%d,1,true;" % rx.index)
+                    # VFO B hörs bara om dess kanal är aktiverad (VFO A är alltid på) -
+                    # skickas alltid (både true och false), annars blir kanalen kvar
+                    # påslagen när man går tillbaka till att bara lyssna på VFO A.
+                    self._send(radio.key, "RX_CHANNEL_ENABLE:%d,1,%s;" % (
+                        rx.index, "true" if 1 in vfos else "false"))
                     for vfo in (0, 1):
                         db = VOL_ON if vfo in vfos else VOL_OFF
                         self._send(radio.key, "RX_VOLUME:%d,%d,%d;" % (rx.index, vfo, db))
