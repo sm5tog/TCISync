@@ -34,9 +34,10 @@ from audio import AudioSwitch
 from sync import Sync
 from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
+from ecoder_leds import LedController
 from spot_feed import SpotFeed
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(_BASE_DIR, "tcisync_settings.json")
@@ -153,8 +154,12 @@ class Cockpit:
         cw_cfg = dict(DEFAULT_CW_SETTINGS)
         cw_cfg.update(load_settings().get("cw", {}))
         panel_map_cfg = load_settings().get("panel_map", {})
-        self.router = EncoderRouter(self.station, self.links, log=self._log,
-                                     cw_settings=cw_cfg, panel_map=panel_map_cfg)
+        led_cfg = load_settings().get("leds", {})
+        self.router = EncoderRouter(
+            self.station, self.links, log=self._log,
+            cw_settings=cw_cfg, panel_map=panel_map_cfg,
+            led_map=led_cfg.get("map"), backlight_on=led_cfg.get("backlight"))
+        self.leds = None   # sätts i _start_hid() om E-Codern öppnas
         self.audio = AudioSwitch(self.station, self.links, log=self._log)
         self.sync = Sync(self.station, self.links, log=self._log)
         self._last_audible = self._audible_key()
@@ -207,9 +212,10 @@ class Cockpit:
         try:
             hid.open()
         except OSError as e:
-            self._log("E-Coder ej öppnad: %s" % e)
+            self._log("E-Coder not opened: %s" % e)
             return
         self.hid = hid
+        self.leds = LedController(hid)
         threading.Thread(target=self._reader_loop, daemon=True).start()
 
     def _reader_loop(self):
@@ -257,7 +263,7 @@ class Cockpit:
         dot.pack(side="left")
         self._bind_drag(dot)
         self.dots.append((dot, radio_key))
-        place = "lokal" if radio.place == "local" else "remote"
+        place = "local" if radio.place == "local" else "remote"
         titlbl = ctk.CTkLabel(head, text="%s   %s · %s" % (title, radio.name, place),
                               text_color=th.color("text_primary"), font=self.f_head)
         titlbl.pack(side="left", padx=5)
@@ -322,7 +328,7 @@ class Cockpit:
                            corner_radius=th.METRICS["radius"])
         bar.pack(fill="x", padx=pad, pady=(4, 0))
         self._bind_drag(bar)
-        self.sync_btn = ctk.CTkButton(bar, text="Synk av", font=self.f_btn,
+        self.sync_btn = ctk.CTkButton(bar, text="Sync off", font=self.f_btn,
                                       height=th.METRICS["btn_height"], width=90,
                                       corner_radius=th.METRICS["radius"],
                                       fg_color=th.color("btn_idle_bg"),
@@ -330,7 +336,7 @@ class Cockpit:
                                       text_color=th.color("btn_text"),
                                       command=self._on_sync_toggle)
         self.sync_btn.pack(side="left", padx=(8, 10), pady=4)
-        params = [("vfo", "Frekvens", "sync_vfo"), ("mod", "Mode", "sync_mod"),
+        params = [("vfo", "Frequency", "sync_vfo"), ("mod", "Mode", "sync_mod"),
                   ("vfob", "VFO B", "sync_vfob"), ("rit", "RIT", "sync_rit"),
                   ("filter", "Filter", "sync_filter")]
         self._sync_vars = {}
@@ -349,10 +355,10 @@ class Cockpit:
         self.station.sync_mode = not self.station.sync_mode
         on = self.station.sync_mode
         self.sync_btn.configure(
-            text="Synk på" if on else "Synk av",
+            text="Sync on" if on else "Sync off",
             fg_color=th.color("accent_blue") if on else th.color("btn_idle_bg"),
             hover_color=th.color("accent_blue_bright") if on else th.color("btn_hover_bg"))
-        self._log("Synk %s" % ("på" if on else "av"))
+        self._log("Sync %s" % ("on" if on else "off"))
         if on:
             self.sync.align()          # snäpp remoten till RX1 direkt vid påslag
 
@@ -383,15 +389,15 @@ class Cockpit:
             self._sliders[key] = s
             self._sl_val[key] = v
 
-        add("freq", "Frekvens", 0.4, 1.6, self.scales["freq"], lambda v: self._on_font("freq", v))
-        add("head", "Panelrubrik", 0.4, 1.6, self.scales["head"], lambda v: self._on_font("head", v))
+        add("freq", "Frequency", 0.4, 1.6, self.scales["freq"], lambda v: self._on_font("freq", v))
+        add("head", "Panel title", 0.4, 1.6, self.scales["head"], lambda v: self._on_font("head", v))
         add("status", "Status", 0.4, 1.6, self.scales["status"], lambda v: self._on_font("status", v))
-        add("cw", "Cellbredd", 70, 260, self.cell_w, self._on_cw)
-        add("ch", "Cellhöjd", 22, 80, self.cell_h, self._on_ch)
+        add("cw", "Cell width", 70, 260, self.cell_w, self._on_cw)
+        add("ch", "Cell height", 22, 80, self.cell_h, self._on_ch)
 
         btnrow = ctk.CTkFrame(bar, fg_color="transparent")
         btnrow.pack(fill="x", padx=8, pady=(2, 6))
-        self.copy_btn = ctk.CTkButton(btnrow, text="Kopiera värden",
+        self.copy_btn = ctk.CTkButton(btnrow, text="Copy values",
                                       fg_color=th.color("accent_blue"),
                                       hover_color=th.color("accent_blue_bright"),
                                       font=th.font("small"), height=22, width=120,
@@ -445,7 +451,7 @@ class Cockpit:
         except Exception:
             pass
         print(txt, flush=True)
-        self.copy_lbl.configure(text="Kopierat: " + txt)
+        self.copy_lbl.configure(text="Copied: " + txt)
 
     # ----- händelsepump --------------------------------------------------------
     def _pump(self):
@@ -478,6 +484,10 @@ class Cockpit:
         if audible != self._last_audible:
             self._last_audible = audible
             self.audio.apply()
+        if self.leds:
+            left, right, center = self.router.led_states()
+            self.leds.set(left=left, right=right, center=center,
+                          backlight=self.router.backlight_on)
         if dirty:
             self._refresh()
         self.root.after(20, self._pump)
@@ -604,9 +614,10 @@ class Cockpit:
 
     def _on_win_menu(self, event):
         menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="CW-inställningar...", command=self._open_cw_settings)
-        menu.add_command(label="Knappmappning...", command=self._open_panel_map)
-        menu.add_command(label="Avsluta", command=self._on_close)
+        menu.add_command(label="CW settings...", command=self._open_cw_settings)
+        menu.add_command(label="Button mapping...", command=self._open_panel_map)
+        menu.add_command(label="LEDs...", command=self._open_led_settings)
+        menu.add_command(label="Exit", command=self._on_close)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -622,7 +633,7 @@ class Cockpit:
             return
         keyer, sidetone = self.router.keyer, self.router.sidetone
         win = ctk.CTkToplevel(self.root)
-        win.title("CW-inställningar")
+        win.title("CW settings")
         win.attributes("-topmost", True)
         self._cw_win = win
 
@@ -648,7 +659,7 @@ class Cockpit:
             try:
                 return {k: int(float(e.get())) for k, e in entries.items()}
             except ValueError:
-                self._log("CW-inställningar: ogiltigt värde, inget ändrat")
+                self._log("CW settings: invalid value, nothing changed")
                 return None
 
         def apply_live():
@@ -662,7 +673,7 @@ class Cockpit:
             keyer.debounce_ms = vals["debounce_ms"]
             keyer.break_in_ms = vals["break_in_ms"]
             keyer.ptt_cw_delay_ms = vals["ptt_cw_delay_ms"]
-            self._log("CW-inställningar: tillämpade (live)")
+            self._log("CW settings: applied (live)")
             return vals
 
         def do_save():
@@ -672,16 +683,16 @@ class Cockpit:
             d = load_settings()
             d["cw"] = vals
             save_settings(d)
-            self._log("CW-inställningar: sparade till tcisync_settings.json")
+            self._log("CW settings: saved to tcisync_settings.json")
 
         btns = ctk.CTkFrame(win, fg_color="transparent")
         btns.grid(row=len(fields), column=0, columnspan=2, pady=(6, 8))
-        ctk.CTkButton(btns, text="Tillämpa", width=90, command=apply_live).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Spara", width=90, command=do_save).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Apply", width=90, command=apply_live).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Save", width=90, command=do_save).pack(side="left", padx=4)
 
-    # (rad, kolumn) för varje knapp i panelbilden - samma fysiska placering
-    # som ESDR3:s egen E-Coder-konfigurationsbild. Storvredet upptar den
-    # tomma mitten på rad 2-3, kol 1-2 (ingen knapp där).
+    # (row, column) for each button in the panel image - same physical
+    # placement as ESDR3's own E-Coder configuration image. The main knob
+    # occupies the empty middle of rows 1-2, columns 1-2 (no button there).
     _PANEL_POSITIONS = {
         "zoom_up": (0, 0), "split": (0, 1), "switch_rx": (0, 2),
         "rit_reset": (0, 3), "listen_ab": (0, 4),
@@ -692,58 +703,60 @@ class Cockpit:
     }
 
     def _open_panel_map(self):
-        """Grafisk knappmappning: en klickbar panelbild i samma fysiska layout
-        som ESDR3:s egen E-Coder-konfigurationsskärm. Klick på en knapp öppnar
-        en popup med en dropdown för funktion (TCISyncs egna, se
-        panel_functions.FUNCTION_CATALOG - INTE ESDR3:s inbyggda funktioner,
-        den panelen är avstängd i ESDR3) och ett fritextfält för ev. parameter
-        (t.ex. CW-makrots text, WPM-värdet). Ändringen tillämpas direkt i
-        router.panel_map (live) och sparas till tcisync_settings.json så fort
-        popupen stängs med "OK"."""
+        """Graphical button mapping: a clickable panel image in the same
+        physical layout as ESDR3's own E-Coder configuration screen. Clicking
+        a button opens a popup with a dropdown for its function (TCISync's
+        own, see panel_functions.FUNCTION_CATALOG - NOT ESDR3's built-in
+        functions, that panel is disabled in ESDR3) and a text field for an
+        optional parameter (e.g. the CW macro text, the WPM value). The
+        change is applied live to router.panel_map and saved to
+        tcisync_settings.json as soon as the popup is closed with "OK".
+        Buttons are labeled only by physical number - no invented names."""
         if getattr(self, "_panel_win", None) is not None and self._panel_win.winfo_exists():
             self._panel_win.lift()
             return
         from panel_functions import FUNCTION_CATALOG, BUTTON_LAYOUT, KNOB_PRESS_LAYOUT
 
         win = ctk.CTkToplevel(self.root)
-        win.title("Knappmappning")
+        win.title("Button mapping")
         win.attributes("-topmost", True)
         self._panel_win = win
 
-        grid = ctk.CTkFrame(win, fg_color="transparent")
-        grid.pack(padx=12, pady=(12, 6))
         knob_row = ctk.CTkFrame(win, fg_color="transparent")
-        knob_row.pack(padx=12, pady=(0, 12))
+        knob_row.pack(padx=12, pady=(12, 6))
+        grid = ctk.CTkFrame(win, fg_color="transparent")
+        grid.pack(padx=12, pady=(0, 12))
 
-        self._panel_buttons = {}   # key -> CTkButton (för att uppdatera etiketten efter val)
+        self._panel_buttons = {}   # key -> CTkButton (to update its label after a change)
 
-        def label_for(key, name):
+        def label_for(key, display_name):
             entry = self.router.panel_map.get(key, {"func": "unused"})
             func = entry.get("func", "unused")
             func_label = FUNCTION_CATALOG.get(func, FUNCTION_CATALOG["unused"])["label"]
-            return "%s\n%s" % (name, func_label)
+            return "%s\n%s" % (display_name, func_label)
 
-        def make_click(key, name):
-            return lambda: self._open_function_popup(key, name)
+        def make_click(key, display_name):
+            return lambda: self._open_function_popup(key, display_name)
 
-        for num, key, name in BUTTON_LAYOUT:
-            r, c = self._PANEL_POSITIONS[key]
-            btn = ctk.CTkButton(grid, text=label_for(key, name), width=120, height=50,
-                                 font=self.f_status, command=make_click(key, name))
-            btn.grid(row=r, column=c, padx=4, pady=4)
-            self._panel_buttons[key] = btn
-
-        ctk.CTkLabel(knob_row, text="Vredtryck:", font=self.f_btn).pack(side="left", padx=(0, 8))
-        for key, name in KNOB_PRESS_LAYOUT:
-            btn = ctk.CTkButton(knob_row, text=label_for(key, name), width=140, height=40,
-                                 font=self.f_status, command=make_click(key, name))
+        ctk.CTkLabel(knob_row, text="Knob press:", font=self.f_btn).pack(side="left", padx=(0, 8))
+        for key, display_name in KNOB_PRESS_LAYOUT:
+            btn = ctk.CTkButton(knob_row, text=label_for(key, display_name), width=140, height=40,
+                                 font=self.f_status, command=make_click(key, display_name))
             btn.pack(side="left", padx=4)
             self._panel_buttons[key] = btn
 
+        for num, key in BUTTON_LAYOUT:
+            display_name = "Button %d" % num
+            r, c = self._PANEL_POSITIONS[key]
+            btn = ctk.CTkButton(grid, text=label_for(key, display_name), width=120, height=50,
+                                 font=self.f_status, command=make_click(key, display_name))
+            btn.grid(row=r, column=c, padx=4, pady=4)
+            self._panel_buttons[key] = btn
+
     def _open_function_popup(self, key, name):
-        """Popup för EN knapp: dropdown (funktion) + fritextfält (parameter).
-        OK skriver till router.panel_map (live) OCH tcisync_settings.json
-        direkt, uppdaterar sedan panelknappens etikett."""
+        """Popup for ONE button: dropdown (function) + text field (parameter).
+        OK writes to router.panel_map (live) AND tcisync_settings.json
+        immediately, then updates the panel button's label."""
         from panel_functions import FUNCTION_CATALOG
 
         func_ids = list(FUNCTION_CATALOG.keys())
@@ -762,7 +775,7 @@ class Cockpit:
 
         ctk.CTkLabel(pop, text=name, font=self.f_btn).grid(
             row=0, column=0, columnspan=2, padx=10, pady=(10, 6))
-        ctk.CTkLabel(pop, text="Funktion").grid(row=1, column=0, padx=8, pady=4, sticky="w")
+        ctk.CTkLabel(pop, text="Function").grid(row=1, column=0, padx=8, pady=4, sticky="w")
         var = tk.StringVar(value=id_to_label.get(cur_func, id_to_label["unused"]))
         ctk.CTkOptionMenu(pop, values=func_labels, variable=var, width=210).grid(
             row=1, column=1, padx=8, pady=4)
@@ -784,7 +797,7 @@ class Cockpit:
             pm[key] = item
             d["panel_map"] = pm
             save_settings(d)
-            self._log("Knappmappning: %s -> %s" % (name, FUNCTION_CATALOG[func]["label"]))
+            self._log("Button mapping: %s -> %s" % (name, FUNCTION_CATALOG[func]["label"]))
             self._panel_buttons[key].configure(
                 text="%s\n%s" % (name, FUNCTION_CATALOG[func]["label"]))
             pop.destroy()
@@ -792,7 +805,53 @@ class Cockpit:
         btns = ctk.CTkFrame(pop, fg_color="transparent")
         btns.grid(row=3, column=0, columnspan=2, pady=(6, 10))
         ctk.CTkButton(btns, text="OK", width=90, command=on_ok).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Avbryt", width=90, command=pop.destroy).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Cancel", width=90, command=pop.destroy).pack(side="left", padx=4)
+
+    def _open_led_settings(self):
+        """The 3 status LEDs (left/right/center knob) can each be assigned to
+        mirror the ON/OFF state of any button's current function (see
+        panel_functions.LED_TARGETS / EncoderRouter.led_states). The main-
+        knob light + keypad backlight share a single on/off, they're not
+        individually assignable (per Jonny's spec)."""
+        from panel_functions import LED_TARGETS
+
+        win = ctk.CTkToplevel(self.root)
+        win.title("LEDs")
+        win.attributes("-topmost", True)
+
+        target_labels = [label for _key, label in LED_TARGETS]
+        key_to_label = dict(LED_TARGETS)
+        label_to_key = {label: key for key, label in LED_TARGETS}
+
+        vars_ = {}
+        for i, (slot, disp) in enumerate([("left", "Left knob LED"),
+                                          ("right", "Right knob LED"),
+                                          ("center", "Center knob LED")]):
+            ctk.CTkLabel(win, text=disp).grid(row=i, column=0, padx=8, pady=4, sticky="w")
+            cur = key_to_label.get(self.router.led_map.get(slot, "none"), "None")
+            var = tk.StringVar(value=cur)
+            ctk.CTkOptionMenu(win, values=target_labels, variable=var, width=200).grid(
+                row=i, column=1, padx=8, pady=4)
+            vars_[slot] = var
+
+        bl_var = ctk.BooleanVar(value=self.router.backlight_on)
+        ctk.CTkCheckBox(win, text="Backlight (main knob + keypad)", variable=bl_var).grid(
+            row=3, column=0, columnspan=2, padx=8, pady=(8, 4), sticky="w")
+
+        def on_ok():
+            new_map = {slot: label_to_key.get(var.get(), "none") for slot, var in vars_.items()}
+            self.router.led_map = new_map
+            self.router.backlight_on = bool(bl_var.get())
+            d = load_settings()
+            d["leds"] = {"map": new_map, "backlight": self.router.backlight_on}
+            save_settings(d)
+            self._log("LEDs: saved")
+            win.destroy()
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.grid(row=4, column=0, columnspan=2, pady=(6, 10))
+        ctk.CTkButton(btns, text="OK", width=90, command=on_ok).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Cancel", width=90, command=win.destroy).pack(side="left", padx=4)
 
     def _on_close(self):
         self.stop_flag.set()
@@ -800,6 +859,8 @@ class Cockpit:
         self.spot_feed.stop()
         for link in self.links.values():
             link.stop()
+        if self.leds:
+            self.leds.off()
         if self.hid:
             try:
                 self.hid.close()

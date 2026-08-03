@@ -24,7 +24,7 @@ import time
 
 from cw_keyer import IambicKeyer
 from sidetone import Sidetone
-from panel_functions import DEFAULT_PANEL_MAP
+from panel_functions import DEFAULT_PANEL_MAP, DEFAULT_LED_MAP, DEFAULT_BACKLIGHT
 
 
 def _auto_sidetone_output_name():
@@ -59,18 +59,26 @@ def clamp(v, lo, hi):
 
 
 class EncoderRouter:
-    def __init__(self, station, links, log=None, cw_settings=None, panel_map=None):
+    def __init__(self, station, links, log=None, cw_settings=None, panel_map=None,
+                 led_map=None, backlight_on=None):
         """cw_settings (valfri dict) -> pitch_hz/ramp_ms (Sidetone) och
         dot_pct/dash_pct/gap_pct (IambicKeyer), se cw_keyer.DEFAULT_CW_SETTINGS
         och sunsync.py:s inläsning från sunsync_settings.json (nyckel "cw").
         panel_map (valfri dict) -> knapp-nyckel -> {"func": ..., "param": ...},
-        se panel_functions.py. None/saknad nyckel = DEFAULT_PANEL_MAP:s värde."""
+        se panel_functions.py. None/saknad nyckel = DEFAULT_PANEL_MAP:s värde.
+        led_map (valfri dict) -> "left"/"right"/"center" -> panel-nyckel (eller
+        "none"), se panel_functions.LED_TARGETS. backlight_on (bool) -> stor-
+        vredets ljus + tangentbordsbelysning, ett gemensamt på/av."""
         self.station = station
         self.links = links
         self._log = log or (lambda _t: None)
         self.panel_map = dict(DEFAULT_PANEL_MAP)
         if panel_map:
             self.panel_map.update(panel_map)
+        self.led_map = dict(DEFAULT_LED_MAP)
+        if led_map:
+            self.led_map.update(led_map)
+        self.backlight_on = DEFAULT_BACKLIGHT if backlight_on is None else backlight_on
         self._acc = {"vfo_main": 0, "knob_left": 0, "knob_center": 0, "knob_right": 0}
         self._ts = {}
         self._sent = {}   # tag -> senast skickade värde (för äkta eko-jämförelse, se _guard/_echoed)
@@ -196,8 +204,38 @@ class EncoderRouter:
         radio = self.station.tx_radio()
         rxi = self.station.tx[1]
         self._send(radio.key, "TRX:%d,%s;" % (rxi, "true" if on else "false"))
-        self._log("PTT %s (%s RX%d)" % ("PÅ" if on else "av", radio.name, rxi + 1))
+        self._log("PTT %s (%s RX%d)" % ("ON" if on else "off", radio.name, rxi + 1))
         return False
+
+    # ----- LED-status -----------------------------------------------------------
+    def _button_active_state(self, key):
+        """ON/OFF-tillstånd för VILKEN FUNKTION SOM HELST just nu sitter på
+        `key` (samma panel_map-uppslag som _press använder), för LED-
+        speglingen (se led_states). Funktioner utan ett meningsfullt persist-
+        ent tillstånd (cw_macro, wpm_preset, unused) ger alltid False."""
+        entry = self.panel_map.get(key, {"func": "unused"})
+        func = entry.get("func", "unused")
+        if func == "toggle_listen_both":
+            return self.station.listen_both
+        if func == "toggle_listen_tx":
+            return self.station.listen_tx
+        if func == "change_vfo":
+            return self.station.encoder_on == "tx"
+        if func == "toggle_rit":
+            ri, rxi, _ = self.station.ear
+            return self.station.radios[ri].rx[rxi].rit_on
+        if func == "tune":
+            return self.station.tx_radio().tune
+        return False
+
+    def led_states(self):
+        """(left, right, center) -> bool, utifrån self.led_map. En LED speglar
+        tillståndet hos VAD SOM HELST just nu sitter på den valda knappen -
+        håller sig alltså rätt även om knappens funktion ändras senare."""
+        def val(k):
+            return self._button_active_state(k) if k and k != "none" else False
+        return (val(self.led_map.get("left")), val(self.led_map.get("right")),
+                val(self.led_map.get("center")))
 
     def _press(self, key):
         """Datadriven: slår upp knappens funktion i self.panel_map (se
@@ -210,15 +248,15 @@ class EncoderRouter:
 
         if func == "change_vfo":
             self.station.encoder_on = "tx" if self.station.encoder_on == "ear" else "ear"
-            self._log("Encoder: %s" % ("TX" if self.station.encoder_on == "tx" else "Öra"))
+            self._log("Encoder: %s" % ("TX" if self.station.encoder_on == "tx" else "Ear"))
             return True
         if func == "toggle_listen_tx":
             self.station.listen_tx = not self.station.listen_tx
-            self._log("Lyssnar på %s" % ("TX" if self.station.listen_tx else "hemma"))
+            self._log("Listening to %s" % ("TX" if self.station.listen_tx else "ear"))
             return True
         if func == "toggle_listen_both":
             self.station.listen_both = not self.station.listen_both
-            self._log("TX-lyssning: %s" % ("TX + RX" if self.station.listen_both else "TX endast"))
+            self._log("TX listening: %s" % ("TX + RX" if self.station.listen_both else "TX only"))
             return True
         if func == "tune":
             return self._toggle_tune()
@@ -230,9 +268,9 @@ class EncoderRouter:
         if func == "toggle_rit":
             return self._toggle_rit_enable()
         if func != "unused":
-            self._log("(okänd funktion %r) %s" % (func, key))
+            self._log("(unknown function %r) %s" % (func, key))
             return False
-        self._log("(ledig) %s" % key)
+        self._log("(unused) %s" % key)
         return False
 
     def flush(self):
@@ -256,7 +294,7 @@ class EncoderRouter:
         if not self._valid(cell):
             return False
         self.station.ear = cell
-        self._log("Öra: %s" % self._cellname(cell))
+        self._log("Ear: %s" % self._cellname(cell))
         return True
 
     def set_tx(self, cell):
@@ -274,11 +312,11 @@ class EncoderRouter:
             if old_radio.tune:
                 old_radio.tune = False
                 self._send(old_radio.key, "TUNE:%d,false;" % old[1])
-                self._log("TUNE av på %s RX%d (TX flyttad)" % (old_radio.name, old[1] + 1))
+                self._log("TUNE off on %s RX%d (TX moved)" % (old_radio.name, old[1] + 1))
             if old_rx.split:
                 old_rx.split = False
                 self._send(old_radio.key, "SPLIT_ENABLE:%d,false;" % old[1])
-                self._log("Split av på %s RX%d (TX flyttad)" % (old_radio.name, old[1] + 1))
+                self._log("Split off on %s RX%d (TX moved)" % (old_radio.name, old[1] + 1))
         self.station.tx = cell
         self.apply_tx()
         self._log("TX: %s" % self._cellname(cell))
@@ -381,15 +419,15 @@ class EncoderRouter:
     def _send_macro_text(self, text):
         radio = self.station.tx_radio()
         self._send(radio.key, "CW_MACROS:%d,%s;" % (self.station.tx[1], text))
-        self._log("CW: %s (sänder på %s RX%d)" % (text, radio.name, self.station.tx[1] + 1))
+        self._log("CW: %s (sending on %s RX%d)" % (text, radio.name, self.station.tx[1] + 1))
 
     def _toggle_tune(self):
         radio = self.station.tx_radio()
         rxi = self.station.tx[1]
         radio.tune = not radio.tune
         self._send(radio.key, "TUNE:%d,%s;" % (rxi, "true" if radio.tune else "false"))
-        self._log("TUNE %s%s" % ("PÅ" if radio.tune else "av",
-                                 " - %s RX%d SÄNDER" % (radio.name, rxi + 1) if radio.tune else ""))
+        self._log("TUNE %s%s" % ("ON" if radio.tune else "off",
+                                 " - %s RX%d SENDING" % (radio.name, rxi + 1) if radio.tune else ""))
         return True
 
     def _toggle_rit_enable(self):

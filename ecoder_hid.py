@@ -17,6 +17,7 @@ from ctypes import wintypes
 DIGCF_PRESENT = 0x02
 DIGCF_DEVICEINTERFACE = 0x10
 GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
 FILE_SHARE_READ = 0x01
 FILE_SHARE_WRITE = 0x02
 OPEN_EXISTING = 3
@@ -103,6 +104,9 @@ kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.ReadFile.restype = wintypes.BOOL
 kernel32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
                               ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(OVERLAPPED)]
+kernel32.WriteFile.restype = wintypes.BOOL
+kernel32.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                               ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(OVERLAPPED)]
 kernel32.CreateEventW.restype = wintypes.HANDLE
 kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL,
                                   wintypes.LPCWSTR]
@@ -174,6 +178,7 @@ class EcoderHid:
         self.handle = None
         self.hevent = None
         self.length = 0
+        self.output_length = 0
         self.usage = 0
         self.usage_page = 0
         self.product = ""
@@ -183,12 +188,14 @@ class EcoderHid:
         self._pending = False
 
     def open(self):
+        """GENERIC_READ|GENERIC_WRITE (inte bara READ) - skrivrätten behövs
+        för write() (output-rapporter, t.ex. LED-styrning, se write())."""
         paths = find_device_paths(self.vid, self.pid)
         if not paths:
             raise OSError("E-Coder hittades inte (VID_%04X/PID_%04X). Inkopplad?"
                           % (self.vid, self.pid))
         path = paths[0]
-        self.handle = kernel32.CreateFileW(path, GENERIC_READ,
+        self.handle = kernel32.CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
                                            FILE_SHARE_READ | FILE_SHARE_WRITE, None,
                                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None)
         if self.handle == INVALID_HANDLE_VALUE or self.handle is None:
@@ -199,6 +206,7 @@ class EcoderHid:
                 caps = HIDP_CAPS()
                 if hid.HidP_GetCaps(pp, ctypes.byref(caps)) == HIDP_STATUS_SUCCESS:
                     self.length = caps.InputReportByteLength
+                    self.output_length = caps.OutputReportByteLength
                     self.usage = caps.Usage
                     self.usage_page = caps.UsagePage
             finally:
@@ -242,6 +250,31 @@ class EcoderHid:
             return None
         self._pending = False
         return None
+
+    def write(self, data):
+        """Skickar en output-rapport (t.ex. LED-styrning, ej ännu kartlagd -
+        se ecoder_led_probe.py). data paddas/klipps till output_length byte.
+        Egen (synkron, kortlivad) OVERLAPPED-struktur per anrop - enkelt och
+        skrivningar är sällsynta, ingen anledning att dela med read():s."""
+        if not self.output_length:
+            raise OSError("Enheten rapporterar ingen output-rapportlängd")
+        buf = (bytes(data) + b"\x00" * self.output_length)[:self.output_length]
+        ov = OVERLAPPED()
+        ov.hEvent = kernel32.CreateEventW(None, True, False, None)
+        try:
+            nwritten = wintypes.DWORD(0)
+            ok = kernel32.WriteFile(self.handle, buf, len(buf),
+                                    ctypes.byref(nwritten), ctypes.byref(ov))
+            if not ok:
+                err = ctypes.get_last_error()
+                if err != ERROR_IO_PENDING:
+                    raise OSError("WriteFile-fel %d" % err)
+                kernel32.WaitForSingleObject(ov.hEvent, 500)
+                if not kernel32.GetOverlappedResult(self.handle, ctypes.byref(ov),
+                                                    ctypes.byref(nwritten), False):
+                    raise OSError("WriteFile (overlapped)-fel %d" % ctypes.get_last_error())
+        finally:
+            kernel32.CloseHandle(ov.hEvent)
 
     def close(self):
         try:

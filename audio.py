@@ -58,4 +58,4 @@ class AudioSwitch:
                     self._send(radio.key, "RX_MUTE:%d,true;" % rx.index)
         names = ", ".join("%s RX%d VFO %s" % (st.radios[r].name, rxi + 1, "AB"[v])
                           for (r, rxi, v) in audible)
-        self._log("Ljud: %s" % (names or "(inget)"))
+        self._log("Audio: %s" % (names or "(none)"))

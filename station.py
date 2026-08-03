@@ -112,8 +112,8 @@ def default_station():
     auto_station() inte hittar några ExpertSDR3-profiler alls, t.ex. första
     körningen på en ny dator innan ExpertSDR3 ens anslutit till en radio."""
     return Station([
-        Radio("ramnas", "Ramnäs", "127.0.0.1", 50001, "local", 2),
-        Radio("blecket", "Blecket", "127.0.0.1", 40001, "remote", 1),
+        Radio("local", "Local", "127.0.0.1", 50001, "local", 2),
+        Radio("remote", "Remote", "127.0.0.1", 40001, "remote", 1),
     ])
 
 
@@ -138,7 +138,7 @@ def auto_station(discovered=None):
         return default_station()
     order = {"local": 0, "remote": 1}
     discovered = sorted(discovered, key=lambda r: order.get(r.role, 2))
-    names = {"local": "Lokal", "remote": "Fjärrstyrd"}
+    names = {"local": "Local", "remote": "Remote"}
     radios = [Radio(r.serial, names.get(r.role, r.role), "127.0.0.1", r.port,
                      r.role, r.transceivers)
               for r in discovered]
