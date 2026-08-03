@@ -152,7 +152,9 @@ class Cockpit:
 
         cw_cfg = dict(DEFAULT_CW_SETTINGS)
         cw_cfg.update(load_settings().get("cw", {}))
-        self.router = EncoderRouter(self.station, self.links, log=self._log, cw_settings=cw_cfg)
+        panel_map_cfg = load_settings().get("panel_map", {})
+        self.router = EncoderRouter(self.station, self.links, log=self._log,
+                                     cw_settings=cw_cfg, panel_map=panel_map_cfg)
         self.audio = AudioSwitch(self.station, self.links, log=self._log)
         self.sync = Sync(self.station, self.links, log=self._log)
         self._last_audible = self._audible_key()
@@ -603,6 +605,7 @@ class Cockpit:
     def _on_win_menu(self, event):
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="CW-inställningar...", command=self._open_cw_settings)
+        menu.add_command(label="Knappmappning...", command=self._open_panel_map)
         menu.add_command(label="Avsluta", command=self._on_close)
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -673,6 +676,83 @@ class Cockpit:
 
         btns = ctk.CTkFrame(win, fg_color="transparent")
         btns.grid(row=len(fields), column=0, columnspan=2, pady=(6, 8))
+        ctk.CTkButton(btns, text="Tillämpa", width=90, command=apply_live).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Spara", width=90, command=do_save).pack(side="left", padx=4)
+
+    def _open_panel_map(self):
+        """Grafisk knappmappning: en rad per fysisk E-Coder-knapp (samma 14
+        knappar + de tre vredtrycken som layouten i panel_functions.py),
+        en dropdown för funktion (TCISyncs egna, se FUNCTION_CATALOG - INTE
+        ExpertSDR3:s inbyggda funktioner, den panelen är avstängd i ESDR3) och
+        ett fritextfält för ev. parameter (t.ex. CW-makrots text, WPM-värdet).
+        'Tillämpa' ändrar direkt i router.panel_map (live); 'Spara' skriver
+        dessutom till tcisync_settings.json."""
+        if getattr(self, "_panel_win", None) is not None and self._panel_win.winfo_exists():
+            self._panel_win.lift()
+            return
+        from panel_functions import FUNCTION_CATALOG, BUTTON_LAYOUT, KNOB_PRESS_LAYOUT
+
+        win = ctk.CTkToplevel(self.root)
+        win.title("Knappmappning")
+        win.attributes("-topmost", True)
+        self._panel_win = win
+
+        func_ids = list(FUNCTION_CATALOG.keys())
+        func_labels = [FUNCTION_CATALOG[f]["label"] for f in func_ids]
+        label_to_id = dict(zip(func_labels, func_ids))
+        id_to_label = dict(zip(func_ids, func_labels))
+
+        rows = [(str(num), key, name) for (num, key, name) in BUTTON_LAYOUT]
+        rows += [("V/M/H", key, name) for (key, name) in KNOB_PRESS_LAYOUT]
+
+        headers = ["Knapp", "ESDR3-namn (referens)", "Funktion", "Parameter"]
+        for c, h in enumerate(headers):
+            ctk.CTkLabel(win, text=h, font=self.f_btn).grid(row=0, column=c, padx=6, pady=(8, 2))
+
+        entries = {}   # key -> (StringVar, CTkEntry)
+        for i, (num, key, name) in enumerate(rows, start=1):
+            entry = self.router.panel_map.get(key, {"func": "unused"})
+            cur_func = entry.get("func", "unused")
+            cur_param = entry.get("param", "")
+
+            ctk.CTkLabel(win, text=num).grid(row=i, column=0, padx=6, pady=2)
+            ctk.CTkLabel(win, text=name).grid(row=i, column=1, padx=6, pady=2, sticky="w")
+
+            var = tk.StringVar(value=id_to_label.get(cur_func, id_to_label["unused"]))
+            ctk.CTkOptionMenu(win, values=func_labels, variable=var, width=210).grid(
+                row=i, column=2, padx=6, pady=2)
+
+            pentry = ctk.CTkEntry(win, width=100)
+            if cur_param not in (None, ""):
+                pentry.insert(0, str(cur_param))
+            pentry.grid(row=i, column=3, padx=6, pady=2)
+
+            entries[key] = (var, pentry)
+
+        def read_map():
+            result = {}
+            for key, (var, pentry) in entries.items():
+                func = label_to_id.get(var.get(), "unused")
+                item = {"func": func}
+                param_raw = pentry.get().strip()
+                if param_raw:
+                    item["param"] = param_raw
+                result[key] = item
+            return result
+
+        def apply_live():
+            self.router.panel_map = read_map()
+            self._log("Knappmappning: tillämpad (live)")
+
+        def do_save():
+            apply_live()
+            d = load_settings()
+            d["panel_map"] = self.router.panel_map
+            save_settings(d)
+            self._log("Knappmappning: sparad till tcisync_settings.json")
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.grid(row=len(rows) + 1, column=0, columnspan=4, pady=(8, 10))
         ctk.CTkButton(btns, text="Tillämpa", width=90, command=apply_live).pack(side="left", padx=4)
         ctk.CTkButton(btns, text="Spara", width=90, command=do_save).pack(side="left", padx=4)
 

@@ -24,6 +24,7 @@ import time
 
 from cw_keyer import IambicKeyer
 from sidetone import Sidetone
+from panel_functions import DEFAULT_PANEL_MAP
 
 # --- VFO-varvtalsacceleration (porterad ur ecoder_control) ---------------------
 BASE_STEP = 1
@@ -40,25 +41,23 @@ WPM_MAX = 50
 WPM_PRESET = 20
 ECHO_WINDOW = 0.8
 
-MACROS = {
-    "zoom_up": "SM5K",       # knapp 1
-    "zoom_down": "UR 5NN",   # knapp 6
-    "tune": "TU",            # knapp 11
-}
-
-
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
 
 class EncoderRouter:
-    def __init__(self, station, links, log=None, cw_settings=None):
+    def __init__(self, station, links, log=None, cw_settings=None, panel_map=None):
         """cw_settings (valfri dict) -> pitch_hz/ramp_ms (Sidetone) och
         dot_pct/dash_pct/gap_pct (IambicKeyer), se cw_keyer.DEFAULT_CW_SETTINGS
-        och sunsync.py:s inläsning från sunsync_settings.json (nyckel "cw")."""
+        och sunsync.py:s inläsning från sunsync_settings.json (nyckel "cw").
+        panel_map (valfri dict) -> knapp-nyckel -> {"func": ..., "param": ...},
+        se panel_functions.py. None/saknad nyckel = DEFAULT_PANEL_MAP:s värde."""
         self.station = station
         self.links = links
         self._log = log or (lambda _t: None)
+        self.panel_map = dict(DEFAULT_PANEL_MAP)
+        if panel_map:
+            self.panel_map.update(panel_map)
         self._acc = {"vfo_main": 0, "knob_left": 0, "knob_center": 0, "knob_right": 0}
         self._ts = {}
         self._mon_volume = {}   # radio_key -> senast kända MON_VOLUME (dB), från prime()/eko
@@ -162,29 +161,38 @@ class EncoderRouter:
         return False
 
     def _press(self, key):
-        if key == "change_vfo":              # 13: växla encoder öra/TX
+        """Datadriven: slår upp knappens funktion i self.panel_map (se
+        panel_functions.py) i stället för en hårdkodad if/elif-kedja, så
+        knapptilldelningen kan ändras via ett grafiskt konfigurationsverktyg
+        utan kodändring."""
+        entry = self.panel_map.get(key, {"func": "unused"})
+        func = entry.get("func", "unused")
+        param = entry.get("param")
+
+        if func == "change_vfo":
             self.station.encoder_on = "tx" if self.station.encoder_on == "ear" else "ear"
             self._log("Encoder: %s" % ("TX" if self.station.encoder_on == "tx" else "Öra"))
             return True
-        if key == "vfob_onoff":              # 14: toggla tillfällig TX-lyssning
+        if func == "toggle_listen_tx":
             self.station.listen_tx = not self.station.listen_tx
             self._log("Lyssnar på %s" % ("TX" if self.station.listen_tx else "hemma"))
             return True
-        if key == "listen_b":                # 12: toggla listen_both-läget
+        if func == "toggle_listen_both":
             self.station.listen_both = not self.station.listen_both
             self._log("TX-lyssning: %s" % ("TX + RX" if self.station.listen_both else "TX endast"))
             return True
-        if key == "switch_rx":               # 3: TUNE (sänder på TX-radion)
+        if func == "tune":
             return self._toggle_tune()
-        if key in MACROS:                    # 1/6/11: CW-makro på TX-radion
-            self._send_macro(key)
+        if func == "cw_macro":
+            self._send_macro_text(param or "")
             return False
-        if key == "custom_vred_v_tryck":     # WPM-vred-tryck -> 20 WPM
-            return self._set_wpm(WPM_PRESET)
-        if key == "custom_vred_h_tryck":     # RIT-vred-tryck -> RIT på/av (öra-RX)
+        if func == "wpm_preset":
+            return self._set_wpm(int(param) if param else WPM_PRESET)
+        if func == "toggle_rit":
             return self._toggle_rit_enable()
-        # Lediga: split(2), rit_reset(4), listen_ab(5), step_down(7), step_up(8),
-        # if_as_rit(9), listen_a(10), custom_vred_m_tryck. (SPLIT sätts nu av TX-VFO:n.)
+        if func != "unused":
+            self._log("(okänd funktion %r) %s" % (func, key))
+            return False
         self._log("(ledig) %s" % key)
         return False
 
@@ -331,9 +339,8 @@ class EncoderRouter:
         self._send(radio.key, "RIT_OFFSET:%d,%d;" % (rxi, rx.rit_offset))
         return True
 
-    def _send_macro(self, key):
+    def _send_macro_text(self, text):
         radio = self.station.tx_radio()
-        text = MACROS[key]
         self._send(radio.key, "CW_MACROS:%d,%s;" % (self.station.tx[1], text))
         self._log("CW: %s (sänder på %s RX%d)" % (text, radio.name, self.station.tx[1] + 1))
 
