@@ -35,6 +35,7 @@ import time
 DIT_UNIT_MS = 1200.0   # 1200/WPM = en dit-längd i ms (PARIS-standarden)
 
 DEFAULT_CW_SETTINGS = {
+    "key_type": "paddle",  # "paddle" (IambicKeyer) eller "straight" (StraightKeyer)
     "dot_pct": 100,      # dit-längd i % av en enhet (u)
     "dash_pct": 300,     # dah-längd i % av en enhet
     "gap_pct": 100,      # mellanrum mellan element i % av en enhet
@@ -112,39 +113,55 @@ class IambicKeyer:
 
     def _run(self):
         while not self._stop.is_set():
-            if self._dit_latch or self._dah_latch:
-                if not self._tx_active:
-                    self._send_trx(True)   # drar riktig PTT/interlock, inte bara KEYER
-                    self._tx_active = True
-                    # paus innan FÖRSTA elementet - annars klipps dess början bort
-                    # medan sändarkedjan (relä/PA) fortfarande kopplar om till TX
-                    time.sleep(self.ptt_cw_delay_ms / 1000.0)
-                self._idle_since = None
-                if self._dit_latch and self._dah_latch:
-                    elem = "dah" if self._last == "dit" else "dit"
-                else:
-                    elem = "dit" if self._dit_latch else "dah"
-                self._last = elem
-                self._send_element(elem)
-                # konsumera EFTER att elementet (+ mellanrum) spelats klart - ett kort
-                # tryck hinner släppas på riktigt under den tiden. Läser vi av detta
-                # innan sändningen ser vi alltid "fortfarande nedtryckt" (ett släpp
-                # hinner aldrig ske på den bråkdels millisekund det tar loopen att
-                # reagera), vilket ovillkorligen skulle köa ett extra element.
-                if elem == "dit":
-                    self._dit_latch = self.dit_down
-                else:
-                    self._dah_latch = self.dah_down
-            else:
+            try:
+                self._run_step()
+            except Exception as e:
+                # Ett undantag här får ALDRIG lämna riktig PTT pådragen - släpp
+                # den ovillkorligen innan loopen fortsätter (stuck-TX är en
+                # allvarligare risk än att tappa ett CW-element).
+                self._log("CW-keyer-fel: %s" % e)
                 if self._tx_active:
-                    now = time.time()
-                    if self._idle_since is None:
-                        self._idle_since = now
-                    elif (now - self._idle_since) * 1000 >= self.break_in_ms:
-                        self._send_trx(False)   # break-in slut, släpp riktig PTT
-                        self._tx_active = False
-                        self._idle_since = None
-                time.sleep(0.005)
+                    try:
+                        self._send_trx(False)
+                    except Exception:
+                        pass
+                    self._tx_active = False
+                self._idle_since = None
+
+    def _run_step(self):
+        if self._dit_latch or self._dah_latch:
+            if not self._tx_active:
+                self._send_trx(True)   # drar riktig PTT/interlock, inte bara KEYER
+                self._tx_active = True
+                # paus innan FÖRSTA elementet - annars klipps dess början bort
+                # medan sändarkedjan (relä/PA) fortfarande kopplar om till TX
+                time.sleep(self.ptt_cw_delay_ms / 1000.0)
+            self._idle_since = None
+            if self._dit_latch and self._dah_latch:
+                elem = "dah" if self._last == "dit" else "dit"
+            else:
+                elem = "dit" if self._dit_latch else "dah"
+            self._last = elem
+            self._send_element(elem)
+            # konsumera EFTER att elementet (+ mellanrum) spelats klart - ett kort
+            # tryck hinner släppas på riktigt under den tiden. Läser vi av detta
+            # innan sändningen ser vi alltid "fortfarande nedtryckt" (ett släpp
+            # hinner aldrig ske på den bråkdels millisekund det tar loopen att
+            # reagera), vilket ovillkorligen skulle köa ett extra element.
+            if elem == "dit":
+                self._dit_latch = self.dit_down
+            else:
+                self._dah_latch = self.dah_down
+        else:
+            if self._tx_active:
+                now = time.time()
+                if self._idle_since is None:
+                    self._idle_since = now
+                elif (now - self._idle_since) * 1000 >= self.break_in_ms:
+                    self._send_trx(False)   # break-in slut, släpp riktig PTT
+                    self._tx_active = False
+                    self._idle_since = None
+            time.sleep(0.005)
 
     def _send_element(self, elem):
         """Ett påbörjat element spelas alltid klart i sin fulla längd, oavsett
@@ -164,3 +181,90 @@ class IambicKeyer:
         if self._sidetone:
             self._sidetone.off()
         time.sleep(gap / 1000.0)         # mellanrum mellan element
+
+
+class StraightKeyer:
+    """Rak nyckling för en enkel manipulator/straight key, i stället för
+    IambicKeyers paddel-timing (dit/dah-element, squeeze-memory). Här finns
+    inga element att beräkna - kontaktens egen nedtryckta tid ÄR tecknet,
+    operatören formar det själv för hand.
+
+    set_key(on) matar BÅDA E-Coderns kontakter (cw_dit och cw_dah) hit i
+    straight-läge (se encoder_router.py) - vilken av de två pinnarna en
+    riktig rak nyckel råkar vara inkopplad på spelar ingen roll.
+
+    Samma break-in-mönster mot riktig PTT (TRX) som IambicKeyer: TX dras vid
+    första nedtryck, släpps `break_in_ms` efter sista släppet - inte direkt
+    vid varje enskilt tecken (skulle knattra PTT-relät)."""
+
+    def __init__(self, send_keyer, send_trx=None, sidetone=None, log=None,
+                 debounce_ms=None, break_in_ms=None):
+        self._send_keyer = send_keyer
+        self._send_trx = send_trx or (lambda _state: None)
+        self._sidetone = sidetone
+        self._log = log or (lambda _t: None)
+        d = DEFAULT_CW_SETTINGS
+        self.debounce_ms = debounce_ms if debounce_ms is not None else d["debounce_ms"]
+        self.break_in_ms = break_in_ms if break_in_ms is not None else d["break_in_ms"]
+        self._down = False
+        self._down_ts = 0.0
+        self._key_since = 0.0
+        self._tx_active = False
+        self._idle_since = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def set_key(self, on):
+        now = time.time()
+        if on == self._down or now - self._down_ts < self.debounce_ms / 1000.0:
+            return
+        self._down_ts = now
+        self._down = on
+        if on:
+            if not self._tx_active:
+                self._send_trx(True)   # drar riktig PTT/interlock
+                self._tx_active = True
+            self._idle_since = None
+            self._key_since = now
+            if self._sidetone:
+                self._sidetone.on()
+            self._send_keyer(True, 0)
+        else:
+            duration_ms = int((now - self._key_since) * 1000)
+            if self._sidetone:
+                self._sidetone.off()
+            self._send_keyer(False, duration_ms)
+
+    def stop(self):
+        self._stop.set()
+        if self._tx_active:
+            self._send_trx(False)
+            self._tx_active = False
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                self._run_step()
+            except Exception as e:
+                # Samma princip som IambicKeyer._run: ett undantag får aldrig
+                # lämna riktig PTT pådragen.
+                self._log("CW-keyer-fel: %s" % e)
+                if self._tx_active:
+                    try:
+                        self._send_trx(False)
+                    except Exception:
+                        pass
+                    self._tx_active = False
+                self._idle_since = None
+
+    def _run_step(self):
+        if not self._down and self._tx_active:
+            now = time.time()
+            if self._idle_since is None:
+                self._idle_since = now
+            elif (now - self._idle_since) * 1000 >= self.break_in_ms:
+                self._send_trx(False)   # break-in slut, släpp riktig PTT
+                self._tx_active = False
+                self._idle_since = None
+        time.sleep(0.005)

@@ -22,7 +22,7 @@ handle_tci (TCI -> modell).
 
 import time
 
-from cw_keyer import IambicKeyer
+from cw_keyer import IambicKeyer, StraightKeyer
 from sidetone import Sidetone
 from panel_functions import DEFAULT_PANEL_MAP, DEFAULT_LED_MAP, DEFAULT_BACKLIGHT
 
@@ -92,18 +92,28 @@ class EncoderRouter:
             freq_hz=cw.get("pitch_hz", 700),
             ramp_ms=cw.get("ramp_ms", 7),
             output_name=output_name)
-        self.keyer = IambicKeyer(
-            get_wpm=lambda: self.station.tx_radio().wpm,
-            send_keyer=self._send_keyer,
-            send_trx=self._send_keyer_trx,
-            sidetone=self.sidetone,
-            log=self._log,
-            dot_pct=cw.get("dot_pct"),
-            dash_pct=cw.get("dash_pct"),
-            gap_pct=cw.get("gap_pct"),
-            debounce_ms=cw.get("debounce_ms"),
-            break_in_ms=cw.get("break_in_ms"),
-            ptt_cw_delay_ms=cw.get("ptt_cw_delay_ms"))
+        self.key_type = cw.get("key_type", "paddle")
+        if self.key_type == "straight":
+            self.keyer = StraightKeyer(
+                send_keyer=self._send_keyer,
+                send_trx=self._send_keyer_trx,
+                sidetone=self.sidetone,
+                log=self._log,
+                debounce_ms=cw.get("debounce_ms"),
+                break_in_ms=cw.get("break_in_ms"))
+        else:
+            self.keyer = IambicKeyer(
+                get_wpm=lambda: self.station.tx_radio().wpm,
+                send_keyer=self._send_keyer,
+                send_trx=self._send_keyer_trx,
+                sidetone=self.sidetone,
+                log=self._log,
+                dot_pct=cw.get("dot_pct"),
+                dash_pct=cw.get("dash_pct"),
+                gap_pct=cw.get("gap_pct"),
+                debounce_ms=cw.get("debounce_ms"),
+                break_in_ms=cw.get("break_in_ms"),
+                ptt_cw_delay_ms=cw.get("ptt_cw_delay_ms"))
 
     def stop(self):
         self.keyer.stop()
@@ -148,13 +158,16 @@ class EncoderRouter:
             if key in self._acc:
                 self._acc[key] += value
             return False
-        if key == "cw_dit":                    # manipulator, kort kontakt (byte 4, mask 0x20)
+        if key in ("cw_dit", "cw_dah"):         # manipulator, kort/lång kontakt (byte 4, mask 0x20/0x10)
             if kind in ("press", "release"):
-                self.keyer.set_dit(kind == "press")
-            return False
-        if key == "cw_dah":                    # manipulator, lång kontakt (byte 4, mask 0x10)
-            if kind in ("press", "release"):
-                self.keyer.set_dah(kind == "press")
+                if self.key_type == "straight":
+                    # Straight-läge: en riktig rak nyckel kan vara inkopplad på
+                    # vilken som helst av de två pinnarna - båda nyckling samma sak.
+                    self.keyer.set_key(kind == "press")
+                elif key == "cw_dit":
+                    self.keyer.set_dit(kind == "press")
+                else:
+                    self.keyer.set_dah(kind == "press")
             return False
         if key == "ptt_pedal":                 # PTT-fotpedal (byte 4, mask 0x08)
             if kind in ("press", "release"):

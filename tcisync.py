@@ -21,7 +21,6 @@ import json
 import queue
 import subprocess
 import threading
-import time
 import tkinter as tk
 import urllib.request
 import webbrowser
@@ -38,9 +37,8 @@ from sync import Sync
 from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
-from spot_feed import SpotFeed
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(_BASE_DIR, "tcisync_settings.json")
@@ -73,6 +71,7 @@ def save_settings(d):
 # modelleras/experimenteras med utan kodändring. Defaultvärdena matchar Jonnys
 # ExpertSDR3-profil (Dot 100%, Dash 300%, Dash-Dot pause 100%, Ramp 7ms, Pitch 600Hz).
 DEFAULT_CW_SETTINGS = {
+    "key_type": "paddle",  # "paddle" eller "straight", se cw_keyer.py
     "pitch_hz": 600,
     "ramp_ms": 7,
     "dot_pct": 100,
@@ -82,11 +81,6 @@ DEFAULT_CW_SETTINGS = {
     "break_in_ms": 400,
     "ptt_cw_delay_ms": 50,
 }
-
-SPOT_HOST = "127.0.0.1"
-SPOT_PORT = 7300          # jtspots DEFAULT_TPORT
-SPOT_MAX_AGE_S = 3600     # spot försvinner efter denna ålder
-SPOT_AGE_STEP_S = 300     # nedräkning i 5-minutersblock
 
 UI_SCALE = 0.7            # fallback-default för per-roll-skalorna nedan
 FREQ_SCALE = 0.62         # per-roll textskala (trimmat värde 2026-07-27)
@@ -125,18 +119,12 @@ class Cockpit:
 
         self.station = auto_station()
         self.slots = _build_slots(self.station)
-        # jtspots-spots (ATNO/MTH) matchas bara mot den LOKALA radions RX1/RX2
-        # (spot_feed.py-logiken är byggd kring det), inte hårdkodat mot "ramnas".
-        self._local_key = next((r.key for r in self.station.radios if r.place == "local"),
-                                self.station.radios[0].key)
         self.events = queue.Queue()
         self.links = {}
         self.cells = {}         # (radio_key, rx_idx, vfo) -> CTkLabel (frekvenstext)
         self.cellouter = {}     # -> CTkFrame (öra-ring + storlek)
         self.cellinner = {}     # -> CTkFrame (TX-ring + hörs-nu-fyllning)
         self.dots = []          # (dot_widget, radio_key) per panel
-        self.spot_labels = {}   # rxi (0=RX1, 1=RX2, ramnäs) -> CTkLabel
-        self.last_spot = {}     # rxi -> senaste matchande spot-dict (ATNO/MTH/DX/DXP), inkl. "ts"
 
         # Render-cache: senast satta värde per widget så .configure bara körs vid ändring
         # (ctk .configure ritar om en canvas varje gång -> annars omritningsstorm).
@@ -189,12 +177,8 @@ class Cockpit:
 
         self._start_hid()
 
-        self.spot_feed = SpotFeed(SPOT_HOST, SPOT_PORT, self.events)
-        self.spot_feed.start()
-
         self._update_available_tag = None
         root.after(20, self._pump)
-        root.after(15000, self._spot_tick)
         root.after(0, self._update_check_tick)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh()
@@ -252,11 +236,6 @@ class Cockpit:
             self._log("Could not launch updater: %s" % e)
             return
         self._on_close()
-
-    def _spot_tick(self):
-        """Uppdaterar spot-nedräkningen/utgången även utan nya spot-händelser."""
-        self._refresh_spots()
-        self.root.after(15000, self._spot_tick)
 
     def _log(self, text):
         print(text, flush=True)
@@ -380,28 +359,12 @@ class Cockpit:
                 # varje gång en cells TX-markör sätts med högerklick.
                 w.bind("<Button-3>", lambda e, k=key: self._cell_click(k, "tx") or "break")
 
-        if radio_key == self._local_key and rxi in (0, 1):
-            spot_lbl = ctk.CTkLabel(f, text="", anchor="w",
-                                    text_color=th.color("accent_orange_bright"),
-                                    font=self.f_status, cursor="hand2")
-            spot_lbl.pack(fill="x", padx=M["panel_pad"], pady=(0, 4))
-            spot_lbl.bind("<Button-1>", lambda e, rx=rxi: self._spot_click(rx))
-            self.spot_labels[rxi] = spot_lbl
-
     def _cell_click(self, key, which):
         radio_key, rxi, vfo = key
         cell = (self.station.index_of(radio_key), rxi, vfo)
         dirty = self.router.set_ear(cell) if which == "ear" else self.router.set_tx(cell)
         if dirty:
             self._refresh()
-
-    def _spot_click(self, rxi):
-        spot = self.last_spot.get(rxi)
-        if spot is None:
-            return
-        link = self.links.get(self._local_key)
-        if link is not None:
-            link.send("VFO:0,%d,%d;" % (rxi, spot["freq_hz"]))
 
     # ----- synk-stripa ---------------------------------------------------------
     def _sync_bar(self, pad):
@@ -587,11 +550,6 @@ class Cockpit:
                     self.sync.relay(ev)
                 elif ev.get("kind") == "log":
                     self._log(ev.get("text", ""))
-                elif ev.get("kind") == "spot":
-                    rxi = 1 if ev["digital"] else 0
-                    ev["ts"] = time.time()
-                    self.last_spot[rxi] = ev
-                    dirty = True
         except queue.Empty:
             pass
         if self.router.flush():
@@ -627,26 +585,7 @@ class Cockpit:
             if cache.get(key) != txt:
                 cache[key] = txt
                 lbl.configure(text=txt)
-        self._refresh_spots()
         self._refresh_markers()
-
-    def _refresh_spots(self):
-        now = time.time()
-        for rxi, lbl in self.spot_labels.items():
-            spot = self.last_spot.get(rxi)
-            if spot is not None and now - spot["ts"] >= SPOT_MAX_AGE_S:
-                del self.last_spot[rxi]
-                spot = None
-            if spot is None:
-                txt = ""
-            else:
-                age_min = int((now - spot["ts"]) // SPOT_AGE_STEP_S) * (SPOT_AGE_STEP_S // 60)
-                age_txt = "  · %d min" % age_min if age_min > 0 else ""
-                txt = "[%s] %s  %s%s" % (spot["rule_name"], fmt_freq(spot["freq_hz"]),
-                                         spot["call"], age_txt)
-            if self._cell_text.get(("spot", rxi)) != txt:
-                self._cell_text[("spot", rxi)] = txt
-                lbl.configure(text=txt)
 
     def _refresh_markers(self):
         st = self.station
@@ -700,7 +639,7 @@ class Cockpit:
         # body-drag vore bara förvirrande där. Högerklicksmenyn binds INTE
         # här längre (se root.bind("<Button-3>", ...) i _build_ui) - en
         # per-widget-lista missade tidigare flera ytor (t.ex. cellernas
-        # gridram, spot-etiketten, synk-stripans knapp/kryssrutor), vilket
+        # gridram, synk-stripans knapp/kryssrutor), vilket
         # gjorde att högerklick "strulade" beroende på VAR i fönstret man
         # klickade.
         if self.tweak or self.classic:
@@ -760,23 +699,36 @@ class Cockpit:
             self._cw_win.lift()
             return
         keyer, sidetone = self.router.keyer, self.router.sidetone
+        cw_cfg = dict(DEFAULT_CW_SETTINGS)
+        cw_cfg.update(load_settings().get("cw", {}))
         win = ctk.CTkToplevel(self.root)
         win.title("CW settings")
         win.attributes("-topmost", True)
         self._cw_win = win
 
+        ctk.CTkLabel(win, text="Key type").grid(row=0, column=0, padx=8, pady=4, sticky="w")
+        key_type_var = tk.StringVar(value=self.router.key_type)
+        ctk.CTkOptionMenu(win, values=["paddle", "straight"], variable=key_type_var,
+                          width=120).grid(row=0, column=1, padx=8, pady=4)
+
+        def gv(name):
+            # dot_pct/dash_pct/ptt_cw_delay_ms finns bara på IambicKeyer -
+            # om StraightKeyer är aktiv just nu visas ändå sparade/default-
+            # värden, så de finns kvar oförändrade om man byter tillbaka.
+            return getattr(keyer, name, cw_cfg[name])
+
         fields = [
             ("Pitch (Hz)", "pitch_hz", sidetone.freq_hz),
             ("Ramp (ms)", "ramp_ms", sidetone.ramp_ms),
-            ("Dot (%)", "dot_pct", keyer.dot_pct),
-            ("Dash (%)", "dash_pct", keyer.dash_pct),
-            ("Gap (%)", "gap_pct", keyer.gap_pct),
+            ("Dot (%)", "dot_pct", gv("dot_pct")),
+            ("Dash (%)", "dash_pct", gv("dash_pct")),
+            ("Gap (%)", "gap_pct", gv("gap_pct")),
             ("Debounce (ms)", "debounce_ms", keyer.debounce_ms),
             ("Break-in (ms)", "break_in_ms", keyer.break_in_ms),
-            ("Ptt-CW delay (ms)", "ptt_cw_delay_ms", keyer.ptt_cw_delay_ms),
+            ("Ptt-CW delay (ms)", "ptt_cw_delay_ms", gv("ptt_cw_delay_ms")),
         ]
         entries = {}
-        for i, (label, key, val) in enumerate(fields):
+        for i, (label, key, val) in enumerate(fields, start=1):
             ctk.CTkLabel(win, text=label).grid(row=i, column=0, padx=8, pady=4, sticky="w")
             e = ctk.CTkEntry(win, width=80)
             e.insert(0, str(val))
@@ -793,28 +745,32 @@ class Cockpit:
         def apply_live():
             vals = read_values()
             if vals is None:
-                return
+                return None
             sidetone.reconfigure(freq_hz=vals["pitch_hz"], ramp_ms=vals["ramp_ms"])
-            keyer.dot_pct = vals["dot_pct"]
-            keyer.dash_pct = vals["dash_pct"]
-            keyer.gap_pct = vals["gap_pct"]
             keyer.debounce_ms = vals["debounce_ms"]
             keyer.break_in_ms = vals["break_in_ms"]
-            keyer.ptt_cw_delay_ms = vals["ptt_cw_delay_ms"]
+            if hasattr(keyer, "dot_pct"):    # bara IambicKeyer - se gv()
+                keyer.dot_pct = vals["dot_pct"]
+                keyer.dash_pct = vals["dash_pct"]
+                keyer.gap_pct = vals["gap_pct"]
+                keyer.ptt_cw_delay_ms = vals["ptt_cw_delay_ms"]
             self._log("CW settings: applied (live)")
+            if key_type_var.get() != self.router.key_type:
+                self._log("Key type: %s saved - restart to apply" % key_type_var.get())
             return vals
 
         def do_save():
             vals = apply_live()
             if vals is None:
                 return
+            vals["key_type"] = key_type_var.get()
             d = load_settings()
             d["cw"] = vals
             save_settings(d)
             self._log("CW settings: saved to tcisync_settings.json")
 
         btns = ctk.CTkFrame(win, fg_color="transparent")
-        btns.grid(row=len(fields), column=0, columnspan=2, pady=(6, 8))
+        btns.grid(row=len(fields) + 1, column=0, columnspan=2, pady=(6, 8))
         ctk.CTkButton(btns, text="Apply", width=90, command=apply_live).pack(side="left", padx=4)
         ctk.CTkButton(btns, text="Save", width=90, command=do_save).pack(side="left", padx=4)
 
@@ -1034,7 +990,6 @@ class Cockpit:
     def _on_close(self):
         self.stop_flag.set()
         self.router.stop()
-        self.spot_feed.stop()
         for link in self.links.values():
             link.stop()
         if self.leds:

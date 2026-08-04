@@ -2,6 +2,14 @@
 
 This guide covers how to configure **ExpertSDR3** so TCISync can find and control your radio(s). It supplements the main [README](README.md).
 
+## Förutsättningar
+
+- ExpertSDR3 måste vara installerat och ha minst en fungerande, redan konfigurerad profil (anslutning till radion har gjorts minst en gång) — TCISync skapar inga profiler, bara läser befintliga.
+- TCI-servern måste ha varit aktiverad i den profilen minst en gång.
+- Vid fjärrstyrd radio (ERS): ERS-anslutningen måste redan fungera och ha använts minst en gång, så att `remote_<serial>.json` finns.
+- Ljud måste vara konfigurerat att gå via PC:ns headset eller högtalare/mikrofon — radions egen ljudväg kan inte användas.
+- En E-Coder krävs, och den måste vara avaktiverad i ExpertSDR3 (annars uppstår konflikt med TCISync).
+
 ## How it works
 
 TCISync talks to ExpertSDR3 over **TCI** (Transceiver Control Interface, a websocket protocol built into ExpertSDR3). It does **not** need any IP/port typed in by hand — on every start it reads ExpertSDR3's own local profile files from:
