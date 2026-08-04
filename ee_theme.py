@@ -17,7 +17,7 @@ PALETTE = {
     "accent_green": "#3f9142", "accent_green_bright": "#7cff6a",
     "accent_blue": "#2b6ca6", "accent_blue_bright": "#3a9ad9",
     "accent_red": "#cc2b2b", "accent_orange": "#d38b2a", "accent_orange_bright": "#ffc24a",
-    "bg_heard": "#17251a",
+    "bg_heard": "#2f6b35",
     "text_primary": "#e6e6e6", "text_secondary": "#9aa3b2", "text_disabled": "#5a5f68",
     "text_freq": "#ffffff", "text_freq_secondary": "#b8beca",
     "btn_idle_bg": "#2a2a2e", "btn_idle_border": "#3a3a3e", "btn_hover_bg": "#34343a",

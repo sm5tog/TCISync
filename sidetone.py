@@ -77,20 +77,33 @@ def _low_latency_output_device(preferred_name=None):
 
 
 class Sidetone:
-    def __init__(self, freq_hz=FREQ_HZ, ramp_ms=RAMP_MS, output_name=None):
+    def __init__(self, freq_hz=FREQ_HZ, ramp_ms=RAMP_MS, output_name=None, log=None):
         """output_name -> se _low_latency_output_device(); None = matcha mot
-        Windows systemstandard i stället för ExpertSDR3:s konfigurerade utgång."""
+        Windows systemstandard i stället för ExpertSDR3:s konfigurerade utgång.
+
+        Om ljudenheten inte går att öppna (urdraget headset, fel sample rate
+        m.m.) kraschar INTE appen - self._stream blir None och sidotonen är
+        tyst tills appen startas om med enheten på plats. on()/off()/play()/
+        reconfigure() är no-ops i det läget (bara self._target sätts, ingen
+        ström finns som läser den)."""
         self.freq_hz = freq_hz
         self.ramp_ms = ramp_ms
+        self._log = log or (lambda _t: None)
         self._lock = threading.Lock()
         self._phase = 0.0
         self._amp = 0.0
         self._target = 0.0
-        self._stream = sd.OutputStream(
-            device=_low_latency_output_device(output_name),
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            callback=self._callback, blocksize=BLOCKSIZE, latency="low")
-        self._stream.start()
+        self._stream = None
+        try:
+            stream = sd.OutputStream(
+                device=_low_latency_output_device(output_name),
+                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                callback=self._callback, blocksize=BLOCKSIZE, latency="low")
+            stream.start()
+            self._stream = stream
+        except Exception as e:
+            self._log("Sidetone: could not open audio output (%s) - "
+                       "no local CW sidetone until restart" % e)
 
     def on(self):
         with self._lock:

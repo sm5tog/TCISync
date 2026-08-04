@@ -38,9 +38,15 @@ from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 
-VERSION = "0.12.1"
+VERSION = "0.12.4"
 
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Inuti en PyInstaller-frozen .exe pekar __file__ INTE på .exe-filens egen
+# mapp (bundlens interna extraktionsmapp) - settings/panel-mappning/LED-
+# inställningar skulle tystnat läsas/skrivas fel och aldrig sparas mellan
+# omstarter. sys.frozen sätts alltid av PyInstaller. Samma fix som jtspots
+# (DOCUMENTATION.md §2.20 där), upptäckt vid TCISyncs första exe-build.
+_BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+    else os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(_BASE_DIR, "tcisync_settings.json")
 
 DONATE_URL = "https://www.paypal.com/donate/?hosted_button_id=5VX8NE7LQEGF4"

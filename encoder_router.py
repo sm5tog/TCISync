@@ -91,7 +91,8 @@ class EncoderRouter:
         self.sidetone = Sidetone(
             freq_hz=cw.get("pitch_hz", 700),
             ramp_ms=cw.get("ramp_ms", 7),
-            output_name=output_name)
+            output_name=output_name,
+            log=self._log)
         self.key_type = cw.get("key_type", "paddle")
         if self.key_type == "straight":
             self.keyer = StraightKeyer(

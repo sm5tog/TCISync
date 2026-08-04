@@ -3,4 +3,7 @@ __pycache__/
 *.pyo
 refs/
 *_settings.json
+!tcisync_settings.default.json
 *cred*
+build/
+dist/
