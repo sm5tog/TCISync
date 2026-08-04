@@ -40,12 +40,13 @@ from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 from spot_feed import SpotFeed
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(_BASE_DIR, "tcisync_settings.json")
 
 DONATE_URL = "https://www.paypal.com/donate/?hosted_button_id=5VX8NE7LQEGF4"
+HELP_URL = "https://github.com/sm5tog/TCISync/blob/master/README_TCISYNC.md"
 
 # Auto-uppdatering: samma mönster som jtspots (jtspots_updater.py), men
 # releaserna ligger i SAMMA repos Releases-flik (som rotor sedan 2026-08-01),
@@ -739,6 +740,8 @@ class Cockpit:
         menu.add_command(label="LEDs...", command=self._open_led_settings)
         menu.add_command(label="View...", command=self._open_ui_mode_settings)
         menu.add_separator()
+        menu.add_command(label="Help / ExpertSDR3 setup",
+                          command=lambda: webbrowser.open(HELP_URL))
         menu.add_command(label="Support this project (PayPal)",
                           command=lambda: webbrowser.open(DONATE_URL))
         menu.add_separator()
@@ -1011,9 +1014,22 @@ class Cockpit:
             win.destroy()
 
         btns = ctk.CTkFrame(win, fg_color="transparent")
-        btns.grid(row=3, column=0, columnspan=2, pady=(0, 10))
+        btns.grid(row=3, column=0, columnspan=2, pady=(0, 6))
         ctk.CTkButton(btns, text="OK", width=90, command=on_ok).pack(side="left", padx=4)
         ctk.CTkButton(btns, text="Cancel", width=90, command=win.destroy).pack(side="left", padx=4)
+
+        # Andra ingången till Help/Support, utöver högerklicksmenyn (skill
+        # add-program-help-link: "two entry points beat one").
+        def _link_label(row, text, url):
+            lbl = ctk.CTkLabel(win, text=text, text_color=th.color("text_secondary"),
+                               font=th.font("small"), cursor="hand2")
+            lbl.grid(row=row, column=0, columnspan=2, pady=(0, 4 if row == 4 else 8))
+            lbl.bind("<Button-1>", lambda e: webbrowser.open(url))
+            lbl.bind("<Enter>", lambda e: lbl.configure(text_color=th.color("accent_orange_bright")))
+            lbl.bind("<Leave>", lambda e: lbl.configure(text_color=th.color("text_secondary")))
+
+        _link_label(4, "Help / ExpertSDR3 setup", HELP_URL)
+        _link_label(5, "Support this project (PayPal)", DONATE_URL)
 
     def _on_close(self):
         self.stop_flag.set()
