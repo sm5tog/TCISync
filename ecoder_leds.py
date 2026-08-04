@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ecoder_leds.py - LED/backlight control for the E-Coder2, mapped empirically
+"""ecoder_leds.py - LED/backlight control for the E-Coder, mapped empirically
 2026-08-03 (see DOCUMENTATION.md). Output report is 2 bytes: byte 0 is the
 report ID (always 0x00, has no effect), byte 1 is a bitmask:
 

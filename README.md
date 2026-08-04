@@ -17,7 +17,7 @@ It also solves a problem that otherwise makes manual CW over a remote link impra
 - Auto-detects your radio(s) from ExpertSDR3's own profile files — no IP/port to type in, see [ExpertSDR3 / TCI setup guide](README_TCISYNC.md)
 - Click-to-set ear (listen) and TX markers per VFO, per receiver
 - Frequency/mode/VFO B/RIT/filter sync between radios, toggleable per field
-- Fully configurable E-Coder2 panel button mapping — clickable panel image, any button to any function
+- Fully configurable E-Coder panel button mapping — clickable panel image, any button to any function
 - Status LEDs individually assignable to mirror any button's on/off state
 - Manual CW via an E-Coder paddle (iambic keyer) with local, zero-latency sidetone auto-matched to ExpertSDR3's own audio output
 - Compact (borderless) or Classic (normal window frame) UI, switchable
@@ -32,7 +32,7 @@ Right-click anywhere in the window for the menu (CW settings, Button mapping, LE
 - Windows (tested)
 - Python 3.9+ (only needed if running from source; the compiled `.exe` has no dependencies)
 - ExpertSDR3, with TCI enabled — see [ExpertSDR3 / TCI setup guide](README_TCISYNC.md)
-- An Expert Electronics E-Coder2 panel (optional — TCISync runs without one, just without panel button control)
+- An Expert Electronics E-Coder panel (optional — TCISync runs without one, just without panel button control)
 
 ## Running from source
 

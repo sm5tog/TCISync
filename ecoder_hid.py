@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ecoder_hid.py - delad, fristaende HID-atkomst for Expert Electronics E-Coder2.
+ecoder_hid.py - delad, fristaende HID-atkomst for Expert Electronics E-Coder.
 
 Oppnar E-Codern (default VID_1FC9 / PID_0003) direkt via Windows HID API
 (hid.dll + setupapi.dll) med ctypes - inget pip-beroende, funkar pa Python 3.14.
