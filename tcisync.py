@@ -38,7 +38,7 @@ from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 
-VERSION = "0.12.0"
+VERSION = "0.12.1"
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(_BASE_DIR, "tcisync_settings.json")
@@ -661,8 +661,11 @@ class Cockpit:
         if self._moved:
             x = self._win_origin[0] + dx
             y = self._win_origin[1] + dy
-            x, y = win_snap.snap(self.root.title(), x, y,
-                                  self.root.winfo_width(), self.root.winfo_height())
+            # Magnetisk snapping mot andra cockpitfönster är kopplad till
+            # ontop - samma knapp/kryssruta styr båda, ingen egen inställning.
+            if self.ontop:
+                x, y = win_snap.snap(self.root.title(), x, y,
+                                      self.root.winfo_width(), self.root.winfo_height())
             self.root.geometry("+%d+%d" % (x, y))
 
     def _on_release(self, event):
