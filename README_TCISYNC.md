@@ -102,4 +102,4 @@ Right-click → **View...** lets you switch between **Compact** (the default bor
 4. Check `%LOCALAPPDATA%\Expert Electronics\ExpertSDR3\` actually contains `.json` profile files matching `EED<digits>.json` or `remote_EED<digits>.json` — a `.backup_*`/`.corrupt*`/" - Copy" file is ignored on purpose.
 5. Restart TCISync after changing anything in ExpertSDR3 — profiles are only read at startup.
 
-73, Jonny — SM5TOG
+73, Jonny — SM5K

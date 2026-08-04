@@ -50,4 +50,4 @@ Pre-built Windows executables are published on the [Releases page](https://githu
 
 If this saved you some time or money, consider [buying me a coffee via PayPal](https://www.paypal.com/donate/?hosted_button_id=5VX8NE7LQEGF4). Entirely optional — the software is free either way.
 
-73, Jonny — SM5TOG
+73, Jonny — SM5K
