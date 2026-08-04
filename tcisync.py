@@ -19,9 +19,12 @@ import sys
 import os
 import json
 import queue
+import subprocess
 import threading
 import time
 import tkinter as tk
+import urllib.request
+import webbrowser
 
 import customtkinter as ctk
 
@@ -37,10 +40,20 @@ from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 from spot_feed import SpotFeed
 
-VERSION = "0.9.3"
+VERSION = "0.10.0"
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(_BASE_DIR, "tcisync_settings.json")
+
+DONATE_URL = "https://www.paypal.com/donate/?hosted_button_id=5VX8NE7LQEGF4"
+
+# Auto-uppdatering: samma mönster som jtspots (jtspots_updater.py), men
+# releaserna ligger i SAMMA repos Releases-flik (som rotor sedan 2026-08-01),
+# inte i ett separat "-release"-repo - TCISync är publik källkod från start.
+UPDATE_REPO = "sm5tog/TCISync"
+UPDATE_CHECK_URL = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+UPDATE_CHECK_MS = 60 * 60 * 1000   # en gång i timmen, samma som jtspots
+UPDATER_NAME = "TCISyncUpdater.exe"
 
 
 def load_settings():
@@ -178,10 +191,66 @@ class Cockpit:
         self.spot_feed = SpotFeed(SPOT_HOST, SPOT_PORT, self.events)
         self.spot_feed.start()
 
+        self._update_available_tag = None
         root.after(20, self._pump)
         root.after(15000, self._spot_tick)
+        root.after(0, self._update_check_tick)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh()
+
+    # ----- auto-uppdatering (samma mönster som jtspots) -------------------------
+    def _update_check_tick(self):
+        threading.Thread(target=self._check_for_update, daemon=True).start()
+        self.root.after(UPDATE_CHECK_MS, self._update_check_tick)
+
+    @staticmethod
+    def _version_tuple(v):
+        v = v.strip().lstrip("vV")
+        parts = []
+        for p in v.split("."):
+            try:
+                parts.append(int(p))
+            except ValueError:
+                break
+        return tuple(parts)
+
+    def _check_for_update(self):
+        """Frågar bara GitHubs 'senaste release'-tagg, laddar aldrig ner något
+        själv. Tyst vid nätverksfel/inget repo/inga releaser än."""
+        try:
+            req = urllib.request.Request(UPDATE_CHECK_URL, headers={"User-Agent": "TCISync"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            tag = data.get("tag_name", "")
+            if self._version_tuple(tag) > self._version_tuple(VERSION):
+                self.root.after(0, lambda t=tag: self._show_update_available(t))
+        except Exception:
+            pass
+
+    def _show_update_available(self, tag):
+        if self._update_available_tag == tag:
+            return
+        self._update_available_tag = tag
+        self.update_btn.configure(text="Update: %s" % tag)
+        self.update_btn.pack(side="right", padx=(0, 6), pady=4)
+        self._log("New version %s available - click 'Update: %s' to install" % (tag, tag))
+
+    def _launch_updater(self):
+        """Bara meningsfullt i en fryst .exe (se tcisync_updater.py), loggar
+        och avbryter annars (t.ex. vid `python tcisync.py` under utveckling)."""
+        if not getattr(sys, "frozen", False):
+            self._log("Update is only available in the .exe build")
+            return
+        updater = os.path.join(_BASE_DIR, UPDATER_NAME)
+        if not os.path.exists(updater):
+            self._log("%s not found in the program folder" % UPDATER_NAME)
+            return
+        try:
+            subprocess.Popen([updater, "--update"], cwd=_BASE_DIR)
+        except Exception as e:
+            self._log("Could not launch updater: %s" % e)
+            return
+        self._on_close()
 
     def _spot_tick(self):
         """Uppdaterar spot-nedräkningen/utgången även utan nya spot-händelser."""
@@ -373,6 +442,17 @@ class Cockpit:
                                        text_color=th.color("btn_text"),
                                        command=self._on_ontop_toggle)
         self.ontop_btn.pack(side="right", padx=(0, 8), pady=4)
+
+        # Skapas men packas INTE in - visas bara om _show_update_available
+        # faktiskt hittar en nyare version (se _check_for_update), samma
+        # mönster som jtspots "Uppdatering"-knapp.
+        self.update_btn = ctk.CTkButton(bar, text="", font=self.f_btn,
+                                        height=th.METRICS["btn_height"],
+                                        corner_radius=th.METRICS["radius"],
+                                        fg_color=th.color("accent_blue"),
+                                        hover_color=th.color("accent_blue_bright"),
+                                        text_color=th.color("btn_text"),
+                                        command=self._launch_updater)
 
     def _on_ontop_toggle(self):
         self.ontop = not self.ontop
@@ -658,6 +738,10 @@ class Cockpit:
         menu.add_command(label="Button mapping...", command=self._open_panel_map)
         menu.add_command(label="LEDs...", command=self._open_led_settings)
         menu.add_command(label="View...", command=self._open_ui_mode_settings)
+        menu.add_separator()
+        menu.add_command(label="Support this project (PayPal)",
+                          command=lambda: webbrowser.open(DONATE_URL))
+        menu.add_separator()
         menu.add_command(label="Exit", command=self._on_close)
         try:
             menu.tk_popup(event.x_root, event.y_root)
