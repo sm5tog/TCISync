@@ -119,7 +119,7 @@ class IambicKeyer:
                 # Ett undantag här får ALDRIG lämna riktig PTT pådragen - släpp
                 # den ovillkorligen innan loopen fortsätter (stuck-TX är en
                 # allvarligare risk än att tappa ett CW-element).
-                self._log("CW-keyer-fel: %s" % e)
+                self._log("CW keyer error: %s" % e)
                 if self._tx_active:
                     try:
                         self._send_trx(False)
@@ -249,7 +249,7 @@ class StraightKeyer:
             except Exception as e:
                 # Samma princip som IambicKeyer._run: ett undantag får aldrig
                 # lämna riktig PTT pådragen.
-                self._log("CW-keyer-fel: %s" % e)
+                self._log("CW keyer error: %s" % e)
                 if self._tx_active:
                     try:
                         self._send_trx(False)

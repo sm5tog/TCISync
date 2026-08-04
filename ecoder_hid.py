@@ -138,7 +138,7 @@ def find_device_paths(vid, pid):
     hdev = setupapi.SetupDiGetClassDevsW(ctypes.byref(guid), None, None,
                                          DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
     if hdev == INVALID_HANDLE_VALUE or hdev is None:
-        raise OSError("SetupDiGetClassDevsW misslyckades")
+        raise OSError("SetupDiGetClassDevsW failed")
     paths = []
     try:
         ifdata = SP_DEVICE_INTERFACE_DATA()
@@ -192,14 +192,14 @@ class EcoderHid:
         för write() (output-rapporter, t.ex. LED-styrning, se write())."""
         paths = find_device_paths(self.vid, self.pid)
         if not paths:
-            raise OSError("E-Coder hittades inte (VID_%04X/PID_%04X). Inkopplad?"
+            raise OSError("E-Coder not found (VID_%04X/PID_%04X). Plugged in?"
                           % (self.vid, self.pid))
         path = paths[0]
         self.handle = kernel32.CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
                                            FILE_SHARE_READ | FILE_SHARE_WRITE, None,
                                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None)
         if self.handle == INVALID_HANDLE_VALUE or self.handle is None:
-            raise OSError("Kunde inte oppna E-Codern (fel %d)" % ctypes.get_last_error())
+            raise OSError("Could not open the E-Coder (error %d)" % ctypes.get_last_error())
         pp = ctypes.c_void_p()
         if hid.HidD_GetPreparsedData(self.handle, ctypes.byref(pp)):
             try:
@@ -237,7 +237,7 @@ class EcoderHid:
                 return bytes(self._buf.raw[:self._nread.value])
             err = ctypes.get_last_error()
             if err != ERROR_IO_PENDING:
-                raise OSError("ReadFile-fel %d" % err)
+                raise OSError("ReadFile error %d" % err)
             self._pending = True
         w = kernel32.WaitForSingleObject(self.hevent, timeout_ms)
         if w == WAIT_OBJECT_0:
@@ -257,7 +257,7 @@ class EcoderHid:
         Egen (synkron, kortlivad) OVERLAPPED-struktur per anrop - enkelt och
         skrivningar är sällsynta, ingen anledning att dela med read():s."""
         if not self.output_length:
-            raise OSError("Enheten rapporterar ingen output-rapportlängd")
+            raise OSError("Device reports no output report length")
         buf = (bytes(data) + b"\x00" * self.output_length)[:self.output_length]
         ov = OVERLAPPED()
         ov.hEvent = kernel32.CreateEventW(None, True, False, None)
@@ -268,11 +268,11 @@ class EcoderHid:
             if not ok:
                 err = ctypes.get_last_error()
                 if err != ERROR_IO_PENDING:
-                    raise OSError("WriteFile-fel %d" % err)
+                    raise OSError("WriteFile error %d" % err)
                 kernel32.WaitForSingleObject(ov.hEvent, 500)
                 if not kernel32.GetOverlappedResult(self.handle, ctypes.byref(ov),
                                                     ctypes.byref(nwritten), False):
-                    raise OSError("WriteFile (overlapped)-fel %d" % ctypes.get_last_error())
+                    raise OSError("WriteFile (overlapped) error %d" % ctypes.get_last_error())
         finally:
             kernel32.CloseHandle(ov.hEvent)
 
