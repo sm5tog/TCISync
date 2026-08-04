@@ -4,6 +4,14 @@ A lightweight Windows control panel for **Expert Electronics** radios (SunSDR2/E
 
 ![status](https://img.shields.io/badge/status-active-brightgreen)
 
+## Why TCISync
+
+If you run more than one ExpertSDR3 instance — a local radio plus a remote one over ERS, or several remote radios — but only own ONE set of physical controls (one E-Coder panel, one headset, one CW paddle/key, one PTT pedal), switching which instance or receiver those controls actually act on gets clumsy fast. Normally that means clicking around in each separate ExpertSDR3 window by hand every time you want to listen or transmit somewhere else.
+
+TCISync solves exactly that: a single mouse click moves the ear (listen) and TX focus freely between any receiver on any instance. Your PTT pedal, E-Coder panel, and CW key automatically follow whichever instance is currently TX — no manual switching in ExpertSDR3 itself, ever.
+
+It also solves a problem that otherwise makes manual CW over a remote link impractical: normally your sidetone comes back over the network with the link's round-trip delay, making hand-sending very hard to judge. TCISync generates its sidetone entirely locally with zero network delay, so manual keying works perfectly even on a remotely controlled radio.
+
 ## Features
 
 - Auto-detects your radio(s) from ExpertSDR3's own profile files — no IP/port to type in, see [ExpertSDR3 / TCI setup guide](README_TCISYNC.md)
