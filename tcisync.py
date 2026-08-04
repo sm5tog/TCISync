@@ -37,7 +37,7 @@ from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 from spot_feed import SpotFeed
 
-VERSION = "0.7.0"
+VERSION = "0.9.3"
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(_BASE_DIR, "tcisync_settings.json")
@@ -101,9 +101,11 @@ def fmt_freq(hz):
 
 
 class Cockpit:
-    def __init__(self, root, tweak=False):
+    def __init__(self, root, tweak=False, classic=False, ontop=True):
         self.root = root
         self.tweak = tweak
+        self.classic = classic
+        self.ontop = ontop
         root.title("TCISync (by SM5K)  v%s" % VERSION)
         root.configure(fg_color=th.color("bg_app"))
 
@@ -235,6 +237,12 @@ class Cockpit:
         wrap = ctk.CTkFrame(self.root, fg_color=th.color("bg_app"))
         wrap.pack(fill="both", expand=True, padx=pad, pady=(pad - 4, 0))
         self._bind_drag(wrap)
+        # Högerklicksmenyn: EN bindning på rotfönstret i stället för en
+        # per-widget-lista (se _bind_drag). Tkinter propagerar Button-3 till
+        # root för alla widgetar som inte redan binder den själva, så
+        # frekvenscellernas egen Button-3 (TX-markör, se _rx_panel) fortsätter
+        # fungera som idag.
+        self.root.bind("<Button-3>", self._on_win_menu)
         for i, slot in enumerate(self.slots):
             self._rx_panel(wrap, slot, i)
             wrap.columnconfigure(i, weight=1)
@@ -297,7 +305,10 @@ class Cockpit:
             self.cellinner[key] = inner
             for w in (outer, inner, lbl):
                 w.bind("<Button-1>", lambda e, k=key: self._cell_click(k, "ear"))
-                w.bind("<Button-3>", lambda e, k=key: self._cell_click(k, "tx"))
+                # "break" hindrar eventet från att fortsätta till root-bindningen
+                # (_on_win_menu, se _build_ui) - annars öppnas fönstermenyn OCKSÅ
+                # varje gång en cells TX-markör sätts med högerklick.
+                w.bind("<Button-3>", lambda e, k=key: self._cell_click(k, "tx") or "break")
 
         if radio_key == self._local_key and rxi in (0, 1):
             spot_lbl = ctk.CTkLabel(f, text="", anchor="w",
@@ -350,6 +361,30 @@ class Cockpit:
                                  command=lambda k=key, a=attr: self._on_sync_param(k, a))
             cb.pack(side="left", padx=6, pady=4)
             self._sync_vars[key] = var
+
+        # Rent ASCII-tecken ("alltid överst") i stället för emoji - emoji
+        # ritas av Windows eget färgemoji-typsnitt och lyder inte text_color.
+        self.ontop_btn = ctk.CTkButton(bar, text="^", font=self.f_btn,
+                                       height=th.METRICS["btn_height"], width=28,
+                                       corner_radius=th.METRICS["radius"],
+                                       fg_color=th.color("btn_idle_bg") if self.ontop
+                                       else th.color("accent_blue"),
+                                       hover_color=th.color("accent_blue_bright"),
+                                       text_color=th.color("btn_text"),
+                                       command=self._on_ontop_toggle)
+        self.ontop_btn.pack(side="right", padx=(0, 8), pady=4)
+
+    def _on_ontop_toggle(self):
+        self.ontop = not self.ontop
+        self._apply_ontop()
+        d = load_settings()
+        d["ontop"] = self.ontop
+        save_settings(d)
+
+    def _apply_ontop(self):
+        self.root.attributes("-topmost", self.ontop)
+        self.ontop_btn.configure(
+            fg_color=th.color("btn_idle_bg") if self.ontop else th.color("accent_blue"))
 
     def _on_sync_toggle(self):
         self.station.sync_mode = not self.station.sync_mode
@@ -579,14 +614,19 @@ class Cockpit:
 
     # ----- ramlöst fönster: drag + avsluta-meny --------------------------------
     def _bind_drag(self, widget):
-        # Endast i ramlöst normalläge. Tweak-läget behåller OS-ramen och flyttas
-        # med den vanliga titelraden, så body-drag vore bara förvirrande där.
-        if self.tweak:
+        # Endast i ramlöst normalläge (Compact). Tweak-läget och Classic-läget
+        # behåller OS-ramen och flyttas med den vanliga titelraden, så
+        # body-drag vore bara förvirrande där. Högerklicksmenyn binds INTE
+        # här längre (se root.bind("<Button-3>", ...) i _build_ui) - en
+        # per-widget-lista missade tidigare flera ytor (t.ex. cellernas
+        # gridram, spot-etiketten, synk-stripans knapp/kryssrutor), vilket
+        # gjorde att högerklick "strulade" beroende på VAR i fönstret man
+        # klickade.
+        if self.tweak or self.classic:
             return
         widget.bind("<Button-1>", self._on_press)
         widget.bind("<B1-Motion>", self._on_drag)
         widget.bind("<ButtonRelease-1>", self._on_release)
-        widget.bind("<Button-3>", self._on_win_menu)
 
     def _on_press(self, event):
         self._drag_origin = (event.x_root, event.y_root)
@@ -617,6 +657,7 @@ class Cockpit:
         menu.add_command(label="CW settings...", command=self._open_cw_settings)
         menu.add_command(label="Button mapping...", command=self._open_panel_map)
         menu.add_command(label="LEDs...", command=self._open_led_settings)
+        menu.add_command(label="View...", command=self._open_ui_mode_settings)
         menu.add_command(label="Exit", command=self._on_close)
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -853,6 +894,43 @@ class Cockpit:
         ctk.CTkButton(btns, text="OK", width=90, command=on_ok).pack(side="left", padx=4)
         ctk.CTkButton(btns, text="Cancel", width=90, command=win.destroy).pack(side="left", padx=4)
 
+    def _open_ui_mode_settings(self):
+        """Compact (current, frameless, body-drag) vs Classic (normal OS
+        window frame/titlebar, no body-drag - the OS frame handles moving).
+        Takes effect on next start; overrideredirect can't be toggled live
+        without rebuilding the window."""
+        win = ctk.CTkToplevel(self.root)
+        win.title("View")
+        win.attributes("-topmost", True)
+
+        ctk.CTkLabel(win, text="UI mode").grid(row=0, column=0, padx=8, pady=(10, 4), sticky="w")
+        cur = "classic" if self.classic else "compact"
+        var = tk.StringVar(value=cur)
+        ctk.CTkOptionMenu(win, values=["compact", "classic"], variable=var, width=160).grid(
+            row=0, column=1, padx=8, pady=(10, 4))
+        ctk.CTkLabel(win, text="Takes effect after restart.",
+                     text_color=th.color("text_secondary")).grid(
+            row=1, column=0, columnspan=2, padx=8, pady=(0, 8))
+
+        ontop_var = ctk.BooleanVar(value=self.ontop)
+        ctk.CTkCheckBox(win, text="Always on top", variable=ontop_var).grid(
+            row=2, column=0, columnspan=2, padx=8, pady=(0, 8), sticky="w")
+
+        def on_ok():
+            d = load_settings()
+            d["ui_mode"] = var.get()
+            self.ontop = bool(ontop_var.get())
+            self._apply_ontop()
+            d["ontop"] = self.ontop
+            save_settings(d)
+            self._log("UI mode: saved (%s) - restart to apply" % var.get())
+            win.destroy()
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.grid(row=3, column=0, columnspan=2, pady=(0, 10))
+        ctk.CTkButton(btns, text="OK", width=90, command=on_ok).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Cancel", width=90, command=win.destroy).pack(side="left", padx=4)
+
     def _on_close(self):
         self.stop_flag.set()
         self.router.stop()
@@ -871,17 +949,33 @@ class Cockpit:
 
 def main():
     tweak = "--tweak" in sys.argv[1:]
+    startup_cfg = load_settings()
+    classic = startup_cfg.get("ui_mode") == "classic"
+    ontop = startup_cfg.get("ontop", True)
     th.setup()
     root = ctk.CTk()
-    Cockpit(root, tweak=tweak)
+    Cockpit(root, tweak=tweak, classic=classic, ontop=ontop)
     root.update_idletasks()               # låt widgetarna räkna ut sina begärda storlekar
     if tweak:
         root.geometry("680x400")
         root.minsize(520, 370)
+    elif classic:
+        # Classic: vanlig OS-fönsterram/titelrad (minimera/stäng), ingen
+        # body-drag - OS-ramen sköter flytt. Samma innehållslayout som Compact.
+        w = root.winfo_reqwidth()
+        h = 153 + 30                      # + lite marginal för OS-titelraden
+        cfg = load_settings()
+        if "x" in cfg and "y" in cfg:
+            root.geometry("%dx%d+%d+%d" % (w, h, cfg["x"], cfg["y"]))
+        else:
+            root.geometry("%dx%d" % (w, h))
+        root.minsize(w, h)
+        root.attributes("-topmost", ontop)
     else:
-        # Ramlöst (som rotor): ingen OS-titelrad. Flytta med body-drag, avsluta via
-        # högerklicksmenyn. Auto-anpassa fönstret till innehållets faktiska storlek:
-        # tunn stripa utan svart yta och utan klippning, oavsett trimmade cell-/textmått.
+        # Compact: ramlöst (som rotor), ingen OS-titelrad. Flytta med body-drag,
+        # avsluta via högerklicksmenyn. Auto-anpassa fönstret till innehållets
+        # faktiska storlek: tunn stripa utan svart yta och utan klippning,
+        # oavsett trimmade cell-/textmått.
         root.overrideredirect(True)
         w = root.winfo_reqwidth()
         h = 153                           # samma höjd som rotorfönstret (kompass-storleken)
@@ -891,7 +985,7 @@ def main():
         else:
             root.geometry("%dx%d" % (w, h))
         root.minsize(w, h)
-        root.attributes("-topmost", True)
+        root.attributes("-topmost", ontop)
     root.mainloop()
 
 
