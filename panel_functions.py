@@ -23,7 +23,7 @@ FUNCTION_CATALOG = {
     "change_vfo":          {"label": "Switch encoder ear/TX"},
     "wpm_preset":          {"label": "Set WPM", "param": "wpm", "param_default": 20},
     "toggle_rit":          {"label": "RIT on/off"},
-    "split_offset":        {"label": "Split (som skärmens knapp)"},
+    "split_offset":        {"label": "Split"},
     "toggle_volume_mute":  {"label": "Volume mute/unmute"},
 }
 

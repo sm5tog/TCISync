@@ -66,9 +66,12 @@ class TciLink:
                         continue
                     if not msg:
                         break
-                    buf += msg
-                    while ";" in buf:
-                        cmd, buf = buf.split(";", 1)
+                    # En split per recv (inte en repeterad "in"-scan + split
+                    # per hittat kommando) - sista elementet är ett ev.
+                    # ofullständigt fragment, sparas till nästa recv.
+                    parts = (buf + msg).split(";")
+                    buf = parts.pop()
+                    for cmd in parts:
                         cmd = cmd.strip()
                         if cmd:
                             name, _, rest = cmd.partition(":")

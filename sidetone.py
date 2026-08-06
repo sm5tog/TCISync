@@ -95,6 +95,7 @@ class Sidetone:
         self._amp = 0.0
         self._target = 0.0
         self._stream = None
+        self._buf = np.empty(BLOCKSIZE, dtype=np.float32)   # återanvänd - ingen allokering per callback
         try:
             stream = sd.OutputStream(
                 device=_low_latency_output_device(output_name),
@@ -139,25 +140,37 @@ class Sidetone:
             pass
 
     def _callback(self, outdata, frames, time_info, status):
+        """Vektoriserad (numpy) i stället för en Python for-loop per sample -
+        körs på PortAudios realtidstråd ~690 ggr/sek (BLOCKSIZE=64 vid
+        44100Hz), så per-sample Python-overhead/math.sin()-anrop var den
+        i särklass hetaste koden i appen. Amplitud-rampen är monoton mot
+        target inom EN callback (target ändras bara av on()/off(), lästa en
+        gång i callbackens start), så hela blockets amp-kurva kan räknas ut
+        som en vektor i stället för sample-för-sample."""
         with self._lock:
             target = self._target
             amp = self._amp
         ramp_n = max(1, int(SAMPLE_RATE * self.ramp_ms / 1000))
         step = 1.0 / ramp_n
-        freq = self.freq_hz
         phase = self._phase
-        buf = np.empty(frames, dtype=np.float32)
-        two_pi_f = 2 * math.pi * freq / SAMPLE_RATE
-        for i in range(frames):
-            if amp < target:
-                amp = min(target, amp + step)
-            elif amp > target:
-                amp = max(target, amp - step)
-            buf[i] = amp * self.volume * math.sin(phase)
-            phase += two_pi_f
-            if phase > 2 * math.pi:
-                phase -= 2 * math.pi
+        two_pi_f = 2 * math.pi * self.freq_hz / SAMPLE_RATE
+
+        k = np.arange(frames, dtype=np.float64)
+        if target > amp:
+            amp_arr = np.minimum(target, amp + step * (k + 1))
+        elif target < amp:
+            amp_arr = np.maximum(target, amp - step * (k + 1))
+        else:
+            amp_arr = np.full(frames, amp, dtype=np.float64)
+        new_amp = float(amp_arr[-1]) if frames else amp
+
+        phase_arr = phase + two_pi_f * k
+        new_phase = (phase + two_pi_f * frames) % (2 * math.pi)
+
+        buf = self._buf if frames == BLOCKSIZE else np.empty(frames, dtype=np.float32)
+        np.multiply(amp_arr * self.volume, np.sin(phase_arr), out=buf, casting="unsafe")
         outdata[:, 0] = buf
+
         with self._lock:
-            self._amp = amp
-            self._phase = phase
+            self._amp = new_amp
+            self._phase = new_phase

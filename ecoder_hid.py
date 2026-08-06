@@ -186,6 +186,8 @@ class EcoderHid:
         self._buf = None
         self._nread = None
         self._pending = False
+        self._write_event = None
+        self._write_ov = None
 
     def open(self):
         """GENERIC_READ|GENERIC_WRITE (inte bara READ) - skrivrätten behövs
@@ -222,6 +224,13 @@ class EcoderHid:
         self._buf = ctypes.create_string_buffer(self.length)
         self._nread = wintypes.DWORD(0)
         self._pending = False
+        # Eget event för write() (skild från read()s hevent, samma OVERLAPPED-
+        # struktur återanvänd per anrop i stället för CreateEventW/CloseHandle
+        # varje gång - skrivningar är sällsynta men handtags-syscallen är
+        # onödig, se write().
+        self._write_event = kernel32.CreateEventW(None, True, False, None)
+        self._write_ov = OVERLAPPED()
+        self._write_ov.hEvent = self._write_event
         return self
 
     def read(self, timeout_ms=200):
@@ -254,27 +263,26 @@ class EcoderHid:
     def write(self, data):
         """Skickar en output-rapport (t.ex. LED-styrning, ej ännu kartlagd -
         se ecoder_led_probe.py). data paddas/klipps till output_length byte.
-        Egen (synkron, kortlivad) OVERLAPPED-struktur per anrop - enkelt och
-        skrivningar är sällsynta, ingen anledning att dela med read():s."""
+        Återanvänder self._write_ov/self._write_event (satta i open()) i
+        stället för att skapa/stänga ett Windows-eventhandtag per anrop."""
         if not self.output_length:
             raise OSError("Device reports no output report length")
         buf = (bytes(data) + b"\x00" * self.output_length)[:self.output_length]
-        ov = OVERLAPPED()
-        ov.hEvent = kernel32.CreateEventW(None, True, False, None)
-        try:
-            nwritten = wintypes.DWORD(0)
-            ok = kernel32.WriteFile(self.handle, buf, len(buf),
-                                    ctypes.byref(nwritten), ctypes.byref(ov))
-            if not ok:
-                err = ctypes.get_last_error()
-                if err != ERROR_IO_PENDING:
-                    raise OSError("WriteFile error %d" % err)
-                kernel32.WaitForSingleObject(ov.hEvent, 500)
-                if not kernel32.GetOverlappedResult(self.handle, ctypes.byref(ov),
-                                                    ctypes.byref(nwritten), False):
-                    raise OSError("WriteFile (overlapped) error %d" % ctypes.get_last_error())
-        finally:
-            kernel32.CloseHandle(ov.hEvent)
+        ov = self._write_ov
+        kernel32.ResetEvent(self._write_event)
+        ov.Internal = 0
+        ov.InternalHigh = 0
+        nwritten = wintypes.DWORD(0)
+        ok = kernel32.WriteFile(self.handle, buf, len(buf),
+                                ctypes.byref(nwritten), ctypes.byref(ov))
+        if not ok:
+            err = ctypes.get_last_error()
+            if err != ERROR_IO_PENDING:
+                raise OSError("WriteFile error %d" % err)
+            kernel32.WaitForSingleObject(ov.hEvent, 500)
+            if not kernel32.GetOverlappedResult(self.handle, ctypes.byref(ov),
+                                                ctypes.byref(nwritten), False):
+                raise OSError("WriteFile (overlapped) error %d" % ctypes.get_last_error())
 
     def close(self):
         try:
@@ -286,3 +294,6 @@ class EcoderHid:
             if self.hevent:
                 kernel32.CloseHandle(self.hevent)
                 self.hevent = None
+            if getattr(self, "_write_event", None):
+                kernel32.CloseHandle(self._write_event)
+                self._write_event = None

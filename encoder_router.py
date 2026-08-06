@@ -335,8 +335,10 @@ class EncoderRouter:
         return False
 
     def flush(self):
-        dirty = False
         a = self._acc
+        if not (a["vfo_main"] or a["knob_left"] or a["knob_center"] or a["knob_right"]):
+            return False       # idle - vanliga fallet, undvik onödigt arbete i tick-loopen
+        dirty = False
         if a["vfo_main"]:
             dirty |= self._tune(a["vfo_main"])
         if a["knob_left"]:
@@ -345,8 +347,7 @@ class EncoderRouter:
             dirty |= self._adj_volume(a["knob_center"])
         if a["knob_right"]:
             dirty |= self._adj_drive(a["knob_right"])
-        for k in a:
-            a[k] = 0
+        a["vfo_main"] = a["knob_left"] = a["knob_center"] = a["knob_right"] = 0
         return dirty
 
     # ----- mus (öra/TX-placering) ----------------------------------------------

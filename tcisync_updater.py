@@ -59,7 +59,7 @@ def fetch_latest_release_info():
             zip_url = asset['browser_download_url']
             break
     if not zip_url:
-        raise RuntimeError('Ingen zip-fil hittades i senaste GitHub-releasen')
+        raise RuntimeError('No zip file found in the latest GitHub release')
     return tag, zip_url
 
 
@@ -125,7 +125,7 @@ def launch_tcisync(install_dir: Path):
     if exe.exists():
         subprocess.Popen([str(exe)], cwd=str(install_dir))
     else:
-        print(f'VARNING: hittade ingen tcisync.exe i {install_dir}')
+        print(f'WARNING: no tcisync.exe found in {install_dir}')
 
 
 def spawn_detached(args):
@@ -154,39 +154,39 @@ def _finish_self_update(final_path: Path, staged_path: Path):
 
 def run_install(default_dir: Path):
     print('=== TCISync installation ===')
-    answer = input(f'Installera i "{default_dir}"? [ENTER=ja, eller ange annan sokvag]: ').strip()
+    answer = input(f'Install to "{default_dir}"? [ENTER=yes, or enter a different path]: ').strip()
     target_dir = Path(answer) if answer else default_dir
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    print('Hamtar senaste versionsinfo...')
+    print('Fetching latest release info...')
     tag, zip_url = fetch_latest_release_info()
-    print(f'Laddar ner TCISync {tag}...')
+    print(f'Downloading TCISync {tag}...')
     zip_path = target_dir / '_tcisync_download.zip'
     download_file(zip_url, zip_path)
 
-    print('Packar upp...')
+    print('Extracting...')
     extract_release(zip_path, target_dir)
     zip_path.unlink(missing_ok=True)
 
-    print('Klart. Startar TCISync...')
+    print('Done. Starting TCISync...')
     launch_tcisync(target_dir)
 
 
 def run_update(install_dir: Path):
-    print('=== TCISync uppdatering ===')
+    print('=== TCISync update ===')
     choice = input(
-        'Uppdatera och behall installningar [ENTER],\n'
-        'eller skriv over ALLT inklusive installningar (vid korrupt installation) [o]: '
+        'Update and keep settings [ENTER],\n'
+        'or overwrite EVERYTHING including settings (for a corrupted install) [o]: '
     ).strip().lower()
     overwrite_settings = choice.startswith('o')
 
-    print('Hamtar senaste versionsinfo...')
+    print('Fetching latest release info...')
     tag, zip_url = fetch_latest_release_info()
-    print(f'Laddar ner TCISync {tag}...')
+    print(f'Downloading TCISync {tag}...')
     zip_path = install_dir / '_tcisync_download.zip'
     download_file(zip_url, zip_path)
 
-    print('Packar upp...')
+    print('Extracting...')
     self_name = UPDATER_NAME if is_frozen() else None
     staged_updater = extract_release(zip_path, install_dir, self_exe_name=self_name)
     zip_path.unlink(missing_ok=True)
@@ -195,9 +195,9 @@ def run_update(install_dir: Path):
         default_settings = install_dir / DEFAULT_SETTINGS_NAME
         if default_settings.exists():
             shutil.copy(default_settings, install_dir / SETTINGS_NAME)
-            print('Installningar aterstallda till standardvarden.')
+            print('Settings reset to defaults.')
 
-    print('Klart. Startar TCISync...')
+    print('Done. Starting TCISync...')
     launch_tcisync(install_dir)
 
     if staged_updater is not None:
@@ -219,8 +219,8 @@ def main():
         else:
             run_install(install_dir)
     except Exception as e:
-        print(f'FEL: {e}')
-        input('Tryck ENTER for att stanga...')
+        print(f'ERROR: {e}')
+        input('Press ENTER to close...')
         return
     time.sleep(1.5)
 

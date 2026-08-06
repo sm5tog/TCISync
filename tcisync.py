@@ -38,7 +38,7 @@ from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 
 # Inuti en PyInstaller-frozen .exe pekar __file__ INTE på .exe-filens egen
 # mapp (bundlens interna extraktionsmapp) - settings/panel-mappning/LED-
@@ -702,6 +702,8 @@ class Cockpit:
         menu.add_command(label="LEDs...", command=self._open_led_settings)
         menu.add_command(label="View...", command=self._open_ui_mode_settings)
         menu.add_separator()
+        menu.add_command(label="About...", command=self._open_about)
+        menu.add_separator()
         menu.add_command(label="Help / ExpertSDR3 setup",
                           command=lambda: webbrowser.open(HELP_URL))
         menu.add_command(label="Support this project (PayPal)",
@@ -1039,6 +1041,39 @@ class Cockpit:
 
         _link_label(4, "Help / ExpertSDR3 setup", HELP_URL)
         _link_label(5, "Support this project (PayPal)", DONATE_URL)
+
+    def _open_about(self):
+        """Enda platsen i UI:t där versionsnumret syns i Compact-läge - root.title()
+        innehåller det redan (rad ~124), men Compact kör overrideredirect(True)
+        utan OS-titelrad så den texten är osynlig där (bara synlig i Classic-läge)."""
+        if getattr(self, "_about_win", None) is not None and self._about_win.winfo_exists():
+            self._about_win.lift()
+            return
+        win = ctk.CTkToplevel(self.root)
+        win.title("About")
+        win.attributes("-topmost", True)
+        self._about_win = win
+
+        ctk.CTkLabel(win, text="TCISync (by SM5K)", font=self.f_btn).grid(
+            row=0, column=0, padx=16, pady=(14, 2))
+        ctk.CTkLabel(win, text="Version %s" % VERSION,
+                     text_color=th.color("text_secondary")).grid(
+            row=1, column=0, padx=16, pady=(0, 10))
+
+        def _link_label(row, text, url):
+            lbl = ctk.CTkLabel(win, text=text, text_color=th.color("text_secondary"),
+                               font=th.font("small"), cursor="hand2")
+            lbl.grid(row=row, column=0, pady=(0, 4))
+            lbl.bind("<Button-1>", lambda e: webbrowser.open(url))
+            lbl.bind("<Enter>", lambda e: lbl.configure(text_color=th.color("accent_orange_bright")))
+            lbl.bind("<Leave>", lambda e: lbl.configure(text_color=th.color("text_secondary")))
+
+        _link_label(2, "github.com/sm5tog/TCISync", "https://github.com/%s" % UPDATE_REPO)
+        _link_label(3, "Help / ExpertSDR3 setup", HELP_URL)
+        _link_label(4, "Support this project (PayPal)", DONATE_URL)
+
+        ctk.CTkButton(win, text="Close", width=90, command=win.destroy).grid(
+            row=5, column=0, pady=(6, 14))
 
     def _on_close(self):
         self.stop_flag.set()
