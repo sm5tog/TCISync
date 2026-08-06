@@ -38,7 +38,7 @@ from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 
-VERSION = "0.12.4"
+VERSION = "0.13.0"
 
 # Inuti en PyInstaller-frozen .exe pekar __file__ INTE på .exe-filens egen
 # mapp (bundlens interna extraktionsmapp) - settings/panel-mappning/LED-
@@ -80,6 +80,7 @@ DEFAULT_CW_SETTINGS = {
     "key_type": "paddle",  # "paddle" eller "straight", se cw_keyer.py
     "pitch_hz": 600,
     "ramp_ms": 7,
+    "volume_pct": 35,
     "dot_pct": 100,
     "dash_pct": 300,
     "gap_pct": 100,
@@ -365,11 +366,24 @@ class Cockpit:
                 # varje gång en cells TX-markör sätts med högerklick.
                 w.bind("<Button-3>", lambda e, k=key: self._cell_click(k, "tx") or "break")
 
+        split_btn = ctk.CTkButton(f, text="Split", font=self.f_btn,
+                                  height=th.METRICS["btn_height"],
+                                  corner_radius=M["radius"],
+                                  fg_color=th.color("btn_idle_bg"),
+                                  hover_color=th.color("btn_hover_bg"),
+                                  text_color=th.color("btn_text"),
+                                  command=lambda rk=radio_key, i=rxi: self._on_split(rk, i))
+        split_btn.pack(fill="x", padx=M["panel_pad"], pady=(0, M["panel_pad"] - 4))
+
     def _cell_click(self, key, which):
         radio_key, rxi, vfo = key
         cell = (self.station.index_of(radio_key), rxi, vfo)
         dirty = self.router.set_ear(cell) if which == "ear" else self.router.set_tx(cell)
         if dirty:
+            self._refresh()
+
+    def _on_split(self, radio_key, rxi):
+        if self.router.split_offset(radio_key, rxi):
             self._refresh()
 
     # ----- synk-stripa ---------------------------------------------------------
@@ -700,10 +714,11 @@ class Cockpit:
             menu.grab_release()
 
     def _open_cw_settings(self):
-        """Liveinställningar för keyer/sidoton (dot/dash/gap/pitch/ramp). 'Tillämpa'
-        ändrar direkt i router.keyer/router.sidetone (inget omstartskrav, för att
-        kunna modelleras); 'Spara' skriver dessutom till tcisync_settings.json så
-        värdena finns kvar till nästa start."""
+        """Liveinställningar för keyer/sidoton (dot/dash/gap/pitch/ramp/volym).
+        'Apply' och 'Save' applicerar båda direkt i router.keyer/router.sidetone
+        (inget omstartskrav, inklusive byte av Key type paddle<->straight, se
+        EncoderRouter.set_key_type) - 'Save' skriver dessutom till
+        tcisync_settings.json och stänger fönstret efteråt."""
         if getattr(self, "_cw_win", None) is not None and self._cw_win.winfo_exists():
             self._cw_win.lift()
             return
@@ -744,9 +759,33 @@ class Cockpit:
             e.grid(row=i, column=1, padx=8, pady=4)
             entries[key] = e
 
+        # Sidetone-volym: egen rad med slider, verkar OMEDELBART vid drag -
+        # inte gated bakom Apply/Save som fälten ovan.
+        vol_row = len(fields) + 1
+        ctk.CTkLabel(win, text="Sidetone volume (%)").grid(
+            row=vol_row, column=0, padx=8, pady=4, sticky="w")
+        volume_var = tk.IntVar(value=int(cw_cfg.get("volume_pct", 35)))
+        vol_slider_frame = ctk.CTkFrame(win, fg_color="transparent")
+        vol_slider_frame.grid(row=vol_row, column=1, padx=8, pady=4, sticky="ew")
+        vol_val_lbl = ctk.CTkLabel(vol_slider_frame, text=str(volume_var.get()), width=30)
+
+        def on_volume(v):
+            pct = int(float(v))
+            volume_var.set(pct)
+            vol_val_lbl.configure(text=str(pct))
+            sidetone.reconfigure(volume=pct / 100.0)
+
+        vol_slider = ctk.CTkSlider(vol_slider_frame, from_=0, to=100, command=on_volume,
+                                   width=110)
+        vol_slider.set(volume_var.get())
+        vol_slider.pack(side="left")
+        vol_val_lbl.pack(side="left", padx=(6, 0))
+
         def read_values():
             try:
-                return {k: int(float(e.get())) for k, e in entries.items()}
+                vals = {k: int(float(e.get())) for k, e in entries.items()}
+                vals["volume_pct"] = volume_var.get()
+                return vals
             except ValueError:
                 self._log("CW settings: invalid value, nothing changed")
                 return None
@@ -755,17 +794,21 @@ class Cockpit:
             vals = read_values()
             if vals is None:
                 return None
-            sidetone.reconfigure(freq_hz=vals["pitch_hz"], ramp_ms=vals["ramp_ms"])
-            keyer.debounce_ms = vals["debounce_ms"]
-            keyer.break_in_ms = vals["break_in_ms"]
-            if hasattr(keyer, "dot_pct"):    # bara IambicKeyer - se gv()
-                keyer.dot_pct = vals["dot_pct"]
-                keyer.dash_pct = vals["dash_pct"]
-                keyer.gap_pct = vals["gap_pct"]
-                keyer.ptt_cw_delay_ms = vals["ptt_cw_delay_ms"]
+            sidetone.reconfigure(freq_hz=vals["pitch_hz"], ramp_ms=vals["ramp_ms"],
+                                  volume=vals["volume_pct"] / 100.0)
+            new_type = key_type_var.get()
+            if new_type != self.router.key_type:
+                self.router.set_key_type(new_type, vals)
+            else:
+                k = self.router.keyer
+                k.debounce_ms = vals["debounce_ms"]
+                k.break_in_ms = vals["break_in_ms"]
+                if hasattr(k, "dot_pct"):    # bara IambicKeyer - se gv()
+                    k.dot_pct = vals["dot_pct"]
+                    k.dash_pct = vals["dash_pct"]
+                    k.gap_pct = vals["gap_pct"]
+                    k.ptt_cw_delay_ms = vals["ptt_cw_delay_ms"]
             self._log("CW settings: applied (live)")
-            if key_type_var.get() != self.router.key_type:
-                self._log("Key type: %s saved - restart to apply" % key_type_var.get())
             return vals
 
         def do_save():
@@ -777,9 +820,10 @@ class Cockpit:
             d["cw"] = vals
             save_settings(d)
             self._log("CW settings: saved to tcisync_settings.json")
+            win.destroy()
 
         btns = ctk.CTkFrame(win, fg_color="transparent")
-        btns.grid(row=len(fields) + 1, column=0, columnspan=2, pady=(6, 8))
+        btns.grid(row=vol_row + 1, column=0, columnspan=2, pady=(6, 8))
         ctk.CTkButton(btns, text="Apply", width=90, command=apply_live).pack(side="left", padx=4)
         ctk.CTkButton(btns, text="Save", width=90, command=do_save).pack(side="left", padx=4)
 

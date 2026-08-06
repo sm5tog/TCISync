@@ -47,8 +47,8 @@ ACCEL_EXP = 2.0
 ACCEL_PER_MAX = 2000
 
 DRIVE_STEP = 1
-RIT_STEP = 10
 WPM_STEP = 1
+VOLUME_STEP = 2
 WPM_MIN = 10
 WPM_MAX = 50
 WPM_PRESET = 20
@@ -91,6 +91,7 @@ class EncoderRouter:
         self.sidetone = Sidetone(
             freq_hz=cw.get("pitch_hz", 700),
             ramp_ms=cw.get("ramp_ms", 7),
+            volume=cw.get("volume_pct", 35) / 100.0,
             output_name=output_name,
             log=self._log)
         self.key_type = cw.get("key_type", "paddle")
@@ -119,6 +120,41 @@ class EncoderRouter:
     def stop(self):
         self.keyer.stop()
         self.sidetone.stop()
+
+    def set_key_type(self, key_type, cw_vals=None):
+        """Byter keyer-objekt (IambicKeyer <-> StraightKeyer) live, utan
+        omstart av appen. cw_vals (valfri dict, se DEFAULT_CW_SETTINGS) ->
+        nya parametervärden att bygga den nya keyern med, annars behålls
+        gamla keyerns nuvarande debounce/break_in."""
+        if key_type == self.key_type:
+            return
+        cw_vals = cw_vals or {}
+        debounce_ms = cw_vals.get("debounce_ms", self.keyer.debounce_ms)
+        break_in_ms = cw_vals.get("break_in_ms", self.keyer.break_in_ms)
+        self.keyer.stop()
+        self.key_type = key_type
+        if key_type == "straight":
+            self.keyer = StraightKeyer(
+                send_keyer=self._send_keyer,
+                send_trx=self._send_keyer_trx,
+                sidetone=self.sidetone,
+                log=self._log,
+                debounce_ms=debounce_ms,
+                break_in_ms=break_in_ms)
+        else:
+            self.keyer = IambicKeyer(
+                get_wpm=lambda: self.station.tx_radio().wpm,
+                send_keyer=self._send_keyer,
+                send_trx=self._send_keyer_trx,
+                sidetone=self.sidetone,
+                log=self._log,
+                dot_pct=cw_vals.get("dot_pct"),
+                dash_pct=cw_vals.get("dash_pct"),
+                gap_pct=cw_vals.get("gap_pct"),
+                debounce_ms=debounce_ms,
+                break_in_ms=break_in_ms,
+                ptt_cw_delay_ms=cw_vals.get("ptt_cw_delay_ms"))
+        self._log("Key type: %s (live)" % key_type)
 
     def _send(self, radio_key, cmd):
         link = self.links.get(radio_key)
@@ -238,6 +274,12 @@ class EncoderRouter:
         if func == "toggle_rit":
             ri, rxi, _ = self.station.ear
             return self.station.radios[ri].rx[rxi].rit_on
+        if func == "split_offset":
+            ri, rxi, _ = self.station.ear
+            return self.station.radios[ri].rx[rxi].split
+        if func == "toggle_volume_mute":
+            ri, rxi, _ = self.station.ear
+            return self.station.radios[ri].volume_muted
         if func == "tune":
             return self.station.tx_radio().tune
         return False
@@ -281,6 +323,11 @@ class EncoderRouter:
             return self._set_wpm(int(param) if param else WPM_PRESET)
         if func == "toggle_rit":
             return self._toggle_rit_enable()
+        if func == "split_offset":
+            ri, rxi, _ = self.station.ear
+            return self.split_offset(self.station.radios[ri].key, rxi)
+        if func == "toggle_volume_mute":
+            return self._toggle_volume_mute()
         if func != "unused":
             self._log("(unknown function %r) %s" % (func, key))
             return False
@@ -295,9 +342,9 @@ class EncoderRouter:
         if a["knob_left"]:
             dirty |= self._adj_wpm(a["knob_left"])
         if a["knob_center"]:
-            dirty |= self._adj_drive(a["knob_center"])
+            dirty |= self._adj_volume(a["knob_center"])
         if a["knob_right"]:
-            dirty |= self._adj_rit(a["knob_right"])
+            dirty |= self._adj_drive(a["knob_right"])
         for k in a:
             a[k] = 0
         return dirty
@@ -361,6 +408,38 @@ class EncoderRouter:
         else:
             self._send(radio.key, "SPLIT_ENABLE:%d,%s;" % (rxi, "true" if want else "false"))
 
+    def split_offset(self, radio_key, rxi):
+        """Splitknapp (under frekvenserna i RX-panelen): flyttar TX-markören
+        till mottagarens VFO B (annars sänder radion inte där trots
+        SPLIT_ENABLE - TX-cellen är sanningskällan, set_tx() sköter
+        TX-säkerhet/städning av föregående TX-cell och slår på split via
+        apply_tx()), och sätter sedan VFO B = VFO A + mode-beroende offset
+        (5 kHz SSB, annars 1 kHz), som skriver över det värde apply_tx precis
+        återställde. Öra/encoder-fokus rörs inte."""
+        ri = self.station.index_of(radio_key)
+        if ri < 0 or rxi >= self.station.radios[ri].rx_count:
+            return False
+        radio = self.station.radios[ri]
+        rx = radio.rx[rxi]
+        # Andra trycket (split redan på FÖR DEN HÄR knappens TX-cell) återställer:
+        # TX tillbaka till VFO A, split av, via samma TX-säkerhet som set_tx().
+        if rx.split and self.station.tx == (ri, rxi, 1):
+            self.set_tx((ri, rxi, 0))
+            self._log("Split off: %s RX%d" % (radio.name, rxi + 1))
+            return True
+        base = rx.freq[0]
+        if base is None:
+            return False
+        offset = 5000 if (rx.mode or "") in ("USB", "LSB") else 1000
+        new_b = int(base) + offset
+        self.set_tx((ri, rxi, 1))
+        rx.freq[1] = new_b
+        self._guard(("vfo", radio.key, rxi, 1), new_b)
+        self._send(radio.key, "VFO:%d,1,%d;" % (rxi, new_b))
+        self._log("Split: %s RX%d VFO B = %s (+%d Hz)" % (
+            radio.name, rxi + 1, new_b, offset))
+        return True
+
     def _valid(self, cell):
         ri, rxi, vfo = cell
         return 0 <= ri < len(self.station.radios) and rxi < self.station.radios[ri].rx_count \
@@ -420,14 +499,29 @@ class EncoderRouter:
         self._send(radio.key, "DRIVE:%d,%d;" % (self.station.tx[1], radio.drive))
         return True
 
-    def _adj_rit(self, delta):
+    def _adj_volume(self, delta):
         ri, rxi, _ = self.station.ear
         radio = self.station.radios[ri]
-        rx = radio.rx[rxi]
-        cur = rx.rit_offset or 0
-        rx.rit_offset = int(cur) + delta * RIT_STEP
-        self._guard(("rit", radio.key, rxi), rx.rit_offset)
-        self._send(radio.key, "RIT_OFFSET:%d,%d;" % (rxi, rx.rit_offset))
+        if radio.volume_muted:
+            return False
+        radio.volume = clamp(int(radio.volume) + delta * VOLUME_STEP, -60, 0)
+        self._guard(("volume", radio.key), radio.volume)
+        self._send(radio.key, "VOLUME:%d;" % radio.volume)
+        return True
+
+    def _toggle_volume_mute(self):
+        ri, rxi, _ = self.station.ear
+        radio = self.station.radios[ri]
+        if radio.volume_muted:
+            radio.volume_muted = False
+            radio.volume = radio._volume_before_mute
+            self._send(radio.key, "VOLUME:%d;" % radio.volume)
+            self._log("Volume unmute: %s (%d dB)" % (radio.name, radio.volume))
+        else:
+            radio._volume_before_mute = radio.volume
+            radio.volume_muted = True
+            self._send(radio.key, "VOLUME:-60;")
+            self._log("Volume mute: %s" % radio.name)
         return True
 
     def _send_macro_text(self, text):
@@ -457,12 +551,13 @@ class EncoderRouter:
         radio = self.station.by_key(radio_key)
         if radio is None:
             return
-        cmds = ["CW_KEYER_SPEED;", "CW_MACROS_SPEED;", "MON_VOLUME;"]
+        cmds = ["CW_KEYER_SPEED;", "CW_MACROS_SPEED;", "MON_VOLUME;", "VOLUME;"]
         for rxi in range(radio.rx_count):
             cmds += ["VFO:%d,0;" % rxi, "VFO:%d,1;" % rxi,
                      "RIT_OFFSET:%d;" % rxi, "RIT_ENABLE:%d;" % rxi,
                      "RX_CHANNEL_ENABLE:%d,1;" % rxi,
-                     "DRIVE:%d;" % rxi, "TUNE:%d;" % rxi, "SPLIT_ENABLE:%d;" % rxi]
+                     "DRIVE:%d;" % rxi, "TUNE:%d;" % rxi, "SPLIT_ENABLE:%d;" % rxi,
+                     "MODULATION:%d;" % rxi]
         for c in cmds:
             self._send(radio_key, c)
 
@@ -490,6 +585,12 @@ class EncoderRouter:
                 if not self._echoed(("monvol", radio.key), incoming):
                     self._mon_volume[radio.key] = incoming
                     return True
+            elif name == "VOLUME" and len(args) >= 1:
+                incoming = int(float(args[0]))
+                if not self._echoed(("volume", radio.key), incoming):
+                    if not radio.volume_muted:
+                        radio.volume = incoming
+                    return True
             elif name == "DRIVE" and len(args) >= 2 and args[0] in ("0", "1"):
                 incoming = int(float(args[1]))
                 if not self._echoed(("drive", radio.key), incoming):
@@ -510,7 +611,14 @@ class EncoderRouter:
             elif name == "SPLIT_ENABLE" and len(args) >= 2 and args[0] in ("0", "1"):
                 rxi = int(args[0])
                 if rxi < radio.rx_count:
-                    radio.rx[rxi].split = args[1].lower() == "true"  # per mottagare
+                    on = args[1].lower() == "true"
+                    radio.rx[rxi].split = on  # per mottagare
+                    # Håll TX-cellens VFO i synk om split ändras utifrån (t.ex.
+                    # ExpertSDR3s egen splitknapp på radion) - bara om den här
+                    # mottagaren redan ÄR TX-målet, annars rör vi inte TX-fokus.
+                    ri = self.station.index_of(radio.key)
+                    if (self.station.tx[0], self.station.tx[1]) == (ri, rxi):
+                        self.station.tx = (ri, rxi, 1 if on else 0)
                     return True
             elif name == "RX_CHANNEL_ENABLE" and len(args) >= 3 and args[0] in ("0", "1") and args[1] == "1":
                 rxi = int(args[0])
@@ -520,6 +628,11 @@ class EncoderRouter:
             elif name == "TUNE" and len(args) >= 2 and args[0] in ("0", "1"):
                 radio.tune = args[1].lower() == "true"
                 return True
+            elif name == "MODULATION" and len(args) >= 2 and args[0] in ("0", "1"):
+                rxi = int(args[0])
+                if rxi < radio.rx_count:
+                    radio.rx[rxi].mode = args[1].upper()
+                    return True
         except (ValueError, IndexError, KeyError):
             return False
         return False

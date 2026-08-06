@@ -23,6 +23,8 @@ FUNCTION_CATALOG = {
     "change_vfo":          {"label": "Switch encoder ear/TX"},
     "wpm_preset":          {"label": "Set WPM", "param": "wpm", "param_default": 20},
     "toggle_rit":          {"label": "RIT on/off"},
+    "split_offset":        {"label": "Split (som skärmens knapp)"},
+    "toggle_volume_mute":  {"label": "Volume mute/unmute"},
 }
 
 # (physical number, panel key). No display name beyond the number - see
@@ -79,6 +81,6 @@ DEFAULT_PANEL_MAP = {
     "change_vfo":           {"func": "change_vfo"},
     "vfob_onoff":           {"func": "toggle_listen_tx"},
     "custom_vred_v_tryck":  {"func": "wpm_preset", "param": 20},
-    "custom_vred_m_tryck":  {"func": "unused"},
+    "custom_vred_m_tryck":  {"func": "toggle_volume_mute"},
     "custom_vred_h_tryck":  {"func": "toggle_rit"},
 }

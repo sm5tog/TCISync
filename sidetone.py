@@ -32,7 +32,7 @@ import sounddevice as sd
 FREQ_HZ = 600
 RAMP_MS = 7          # matchar Jonnys ExpertSDR3-profil (Ramp 7ms)
 SAMPLE_RATE = 44100
-AMPLITUDE = 0.35      # av max 1.0, lagom nivå i headset
+VOLUME = 0.35         # av max 1.0, lagom nivå i headset - default, se Sidetone.volume
 BLOCKSIZE = 64        # ~1.45ms/block vid 44100Hz - PortAudios eget val (blocksize=0)
                       # gav 441 (10ms), vilket mätt gav upp till 12ms slumpmässig
                       # fördröjning mellan on()/off() och att ljudtråden märkte det
@@ -77,7 +77,7 @@ def _low_latency_output_device(preferred_name=None):
 
 
 class Sidetone:
-    def __init__(self, freq_hz=FREQ_HZ, ramp_ms=RAMP_MS, output_name=None, log=None):
+    def __init__(self, freq_hz=FREQ_HZ, ramp_ms=RAMP_MS, volume=VOLUME, output_name=None, log=None):
         """output_name -> se _low_latency_output_device(); None = matcha mot
         Windows systemstandard i stället för ExpertSDR3:s konfigurerade utgång.
 
@@ -88,6 +88,7 @@ class Sidetone:
         ström finns som läser den)."""
         self.freq_hz = freq_hz
         self.ramp_ms = ramp_ms
+        self.volume = volume
         self._log = log or (lambda _t: None)
         self._lock = threading.Lock()
         self._phase = 0.0
@@ -121,11 +122,13 @@ class Sidetone:
         self.on()
         threading.Timer(duration_ms / 1000.0, self.off).start()
 
-    def reconfigure(self, freq_hz=None, ramp_ms=None):
+    def reconfigure(self, freq_hz=None, ramp_ms=None, volume=None):
         if freq_hz is not None:
             self.freq_hz = freq_hz
         if ramp_ms is not None:
             self.ramp_ms = ramp_ms
+        if volume is not None:
+            self.volume = volume
 
     def stop(self):
         self.off()
@@ -150,7 +153,7 @@ class Sidetone:
                 amp = min(target, amp + step)
             elif amp > target:
                 amp = max(target, amp - step)
-            buf[i] = amp * AMPLITUDE * math.sin(phase)
+            buf[i] = amp * self.volume * math.sin(phase)
             phase += two_pi_f
             if phase > 2 * math.pi:
                 phase -= 2 * math.pi

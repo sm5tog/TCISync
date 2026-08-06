@@ -37,6 +37,9 @@ class Radio:
         self.drive = None
         self.tune = False
         self.wpm = None
+        self.volume = 0                     # VOLUME (dB, -60..0), huvudvolym
+        self.volume_muted = False           # manuell mute via encoderns mittenknapp
+        self._volume_before_mute = 0        # sparad nivå att återställa vid unmute
         self.rx = [Receiver(i) for i in range(rx_count)]
 
 
