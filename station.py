@@ -28,7 +28,7 @@ class Radio:
 
     def __init__(self, key, name, ip, port, place, rx_count):
         self.key = key
-        self.name = name
+        self.name = name                    # visningsnamn - kan skrivas över av station_names i settings
         self.ip = ip
         self.port = port
         self.place = place                  # 'local' (2 RX) / 'remote' (1 RX)

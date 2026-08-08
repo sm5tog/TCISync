@@ -38,7 +38,7 @@ from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 
 # Inuti en PyInstaller-frozen .exe pekar __file__ INTE på .exe-filens egen
 # mapp (bundlens interna extraktionsmapp) - settings/panel-mappning/LED-
@@ -125,6 +125,10 @@ class Cockpit:
         root.configure(fg_color=th.color("bg_app"))
 
         self.station = auto_station()
+        station_names = load_settings().get("station_names", {})
+        for r in self.station.radios:
+            if r.key in station_names:
+                r.name = station_names[r.key]
         self.slots = _build_slots(self.station)
         self.events = queue.Queue()
         self.links = {}
@@ -178,7 +182,7 @@ class Cockpit:
         self._build_ui()
 
         for r in self.station.radios:
-            link = TciLink(r.key, r.ip, r.port, self.events)
+            link = TciLink(r.key, r.ip, r.port, self.events, name=r.name)
             self.links[r.key] = link
             link.start()
 
@@ -701,6 +705,7 @@ class Cockpit:
         menu.add_command(label="Button mapping...", command=self._open_panel_map)
         menu.add_command(label="LEDs...", command=self._open_led_settings)
         menu.add_command(label="View...", command=self._open_ui_mode_settings)
+        menu.add_command(label="Station names...", command=self._open_station_names)
         menu.add_separator()
         menu.add_command(label="About...", command=self._open_about)
         menu.add_separator()
@@ -720,9 +725,16 @@ class Cockpit:
         'Apply' och 'Save' applicerar båda direkt i router.keyer/router.sidetone
         (inget omstartskrav, inklusive byte av Key type paddle<->straight, se
         EncoderRouter.set_key_type) - 'Save' skriver dessutom till
-        tcisync_settings.json och stänger fönstret efteråt."""
-        if getattr(self, "_cw_win", None) is not None and self._cw_win.winfo_exists():
-            self._cw_win.lift()
+        tcisync_settings.json och döljer fönstret (withdraw, INTE destroy) efteråt.
+        customtkinter-widgetar (~20 st i den här dialogen) är tunga att SKAPA
+        (canvas-komposition per widget för rundade hörn) - withdraw/deiconify
+        återanvänder samma widgetträd i stället för att bygga om det vid varje
+        öppning, vilket annars kändes märkbart trögt varje gång man öppnat
+        dialogen på nytt efter en Save (upptäckt/rapporterat 2026-08-06)."""
+        win = getattr(self, "_cw_win", None)
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
             return
         keyer, sidetone = self.router.keyer, self.router.sidetone
         cw_cfg = dict(DEFAULT_CW_SETTINGS)
@@ -822,7 +834,7 @@ class Cockpit:
             d["cw"] = vals
             save_settings(d)
             self._log("CW settings: saved to tcisync_settings.json")
-            win.destroy()
+            win.withdraw()
 
         btns = ctk.CTkFrame(win, fg_color="transparent")
         btns.grid(row=vol_row + 1, column=0, columnspan=2, pady=(6, 8))
@@ -1041,6 +1053,45 @@ class Cockpit:
 
         _link_label(4, "Help / ExpertSDR3 setup", HELP_URL)
         _link_label(5, "Support this project (PayPal)", DONATE_URL)
+
+    def _open_station_names(self):
+        """Eget namn per radio (t.ex. 'Ramnäs'/'Blecket') istället för auto-
+        detekterade 'Local'/'Remote'. Sparas i tcisync_settings.json under
+        station_names (nyckel = radio.key) och används i header-etiketten
+        (radio.name) och i TCI-felmeddelanden (TciLink.name)."""
+        win = ctk.CTkToplevel(self.root)
+        win.title("Station names")
+        win.attributes("-topmost", True)
+
+        vars_by_key = {}
+        for i, r in enumerate(self.station.radios):
+            ctk.CTkLabel(win, text="%s (%s)" % (r.place, r.key)).grid(
+                row=i, column=0, padx=8, pady=(10 if i == 0 else 4, 4), sticky="w")
+            var = tk.StringVar(value=r.name)
+            vars_by_key[r.key] = var
+            ctk.CTkEntry(win, textvariable=var, width=160).grid(
+                row=i, column=1, padx=8, pady=(10 if i == 0 else 4, 4))
+
+        ctk.CTkLabel(win, text="Takes effect after restart.",
+                     text_color=th.color("text_secondary")).grid(
+            row=len(self.station.radios), column=0, columnspan=2, padx=8, pady=(0, 8))
+
+        def on_ok():
+            d = load_settings()
+            names = d.get("station_names", {})
+            for key, var in vars_by_key.items():
+                val = var.get().strip()
+                if val:
+                    names[key] = val
+            d["station_names"] = names
+            save_settings(d)
+            self._log("Station names: saved - restart to apply")
+            win.destroy()
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.grid(row=len(self.station.radios) + 1, column=0, columnspan=2, pady=(0, 6))
+        ctk.CTkButton(btns, text="OK", width=90, command=on_ok).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Cancel", width=90, command=win.destroy).pack(side="left", padx=4)
 
     def _open_about(self):
         """Enda platsen i UI:t där versionsnumret syns i Compact-läge - root.title()

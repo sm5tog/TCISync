@@ -17,10 +17,11 @@ import websocket
 
 
 class TciLink:
-    def __init__(self, radio_key, ip, port, events):
+    def __init__(self, radio_key, ip, port, events, name=None):
         self.key = radio_key
         self.ip = ip
         self.port = port
+        self.name = name or radio_key
         self.events = events                # delad queue.Queue
         self._ws = None
         self._lock = threading.Lock()
@@ -78,7 +79,10 @@ class TciLink:
                             self._emit(kind="cmd", name=name.upper(),
                                        args=rest.split(",") if rest else [])
             except Exception as e:
-                self._emit(kind="log", text="TCI-fel: %s" % e)
+                hint = ""
+                if isinstance(e, ConnectionRefusedError) or "10061" in str(e):
+                    hint = " - troligen är radion/fjärrstyrningen inte igång"
+                self._emit(kind="log", text="TCI-fel (%s, %s:%d): %s%s" % (self.name, self.ip, self.port, e, hint))
             with self._lock:
                 self._ws = None
             self._emit(kind="status", connected=False)
