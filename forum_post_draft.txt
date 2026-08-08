@@ -1,0 +1,20 @@
+TCISync, a free control panel for multi-instance ExpertSDR3 setups (beta, looking for testers)
+
+Hello everyone.
+
+I want to share a free tool called TCISync. It is aimed at anyone running more than one ExpertSDR3 instance, for example a local radio plus a second one reached remotely over ERS, or several remote radios, but who owns only one set of physical controls. In my case that is one E-Coder panel, one headset, one CW paddle and one PTT pedal. Normally switching which instance or receiver those controls act on means clicking around by hand in each ExpertSDR3 window.
+
+TCISync connects to ExpertSDR3 over TCI and solves that. A single mouse click moves the ear and TX markers freely between any receiver on any radio. Your PTT pedal, E-Coder panel and CW key automatically follow whichever instance is currently TX, so you never touch ExpertSDR3's own controls to switch. The E-Coder panel is fully configurable in TCISync, all 14 buttons plus the three knob presses can be assigned any function, and I have found it genuinely excellent hardware once driven this way.
+
+Two things worth knowing before trying it. Audio must be routed through your PC's headset or speakers and microphone, not the radio's own audio path. An E-Coder is required for the panel and CW/PTT features, and must be disabled inside ExpertSDR3 so TCISync can talk to it directly over HID.
+
+One feature I am especially happy with is manual CW. Keying CW into a remote radio normally means your sidetone returns over the network with the link's round trip delay, making hand sending hard to judge. TCISync generates its sidetone entirely locally with zero network delay, so you hear your own fist exactly as sent, independent of the link. Manual CW that would otherwise be unusable on a remote radio works very well with TCISync.
+
+The program is free, the source is public, and everything is documented in the repository. It auto detects your radios from ExpertSDR3's own profile files, so there is no IP or port to type in anywhere.
+
+This is still early stage software. It is obvious to me how it works because I built it, which is exactly why I need other people's eyes on it. I am looking for beta testers, especially anyone running a local plus remote or multi radio setup, to try it and report what is confusing, what breaks, and what is missing. Any feedback is welcome.
+
+Download here: https://github.com/sm5tog/TCISync/releases/latest
+Setup guide here: https://github.com/sm5tog/TCISync/blob/master/README_TCISYNC.md
+
+73, Jonny SM5K
