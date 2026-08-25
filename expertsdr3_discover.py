@@ -67,10 +67,20 @@ class DiscoveredRadio:
             self.serial, self.role, self.port, self.transceivers)
 
 
-def discover(profile_dir=PROFILE_DIR):
+def discover(profile_dir=PROFILE_DIR, role_overrides=None):
     """Returnerar en lista DiscoveredRadio, en per profilfil vars TCI-server
     är påslagen (Gui.TCI.open == true). Trasiga/oläsbara filer och gamla
-    .backup/.corrupt/" - Copy"-varianter hoppas tyst över."""
+    .backup/.corrupt/" - Copy"-varianter hoppas tyst över.
+
+    `role_overrides`: valfri {serial: "local"/"remote"} från
+    tcisync_settings.json (nyckel "role_overrides"). Profilfilernas "open"-
+    flagga uppdateras inte vid frånkoppling och mtime kan bli missvisande
+    (t.ex. om profilfilen redigerats direkt av en felsökningssession utan att
+    ExpertSDR3 själv anslutit lokalt) - se DOCUMENTATION.md om Blecket-radion
+    (alltid fjärransluten via ERS över 5G) som 2026-08-12 felaktigt visades
+    som "local" eftersom lokal-profilfilen råkade ha färskare mtime än
+    remote_-varianten. En override löser det manuellt tills en mer
+    tillförlitlig live-signal finns."""
     found = []
     if not os.path.isdir(profile_dir):
         return found
@@ -108,6 +118,11 @@ def discover(profile_dir=PROFILE_DIR):
         cur = best.get(r.serial)
         if cur is None or r.mtime > cur.mtime:
             best[r.serial] = r
+    if role_overrides:
+        for r in found:
+            wanted = role_overrides.get(r.serial)
+            if wanted and r.role == wanted:
+                best[r.serial] = r
     return list(best.values())
 
 

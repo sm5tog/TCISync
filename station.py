@@ -136,7 +136,12 @@ def auto_station(discovered=None):
     innan de fungerar med auto-detekterade radioapparater (nästa steg)."""
     if discovered is None:
         from expertsdr3_discover import discover
-        discovered = discover()
+        try:
+            from tcisync import load_settings
+            role_overrides = load_settings().get("role_overrides", {})
+        except ImportError:
+            role_overrides = {}
+        discovered = discover(role_overrides=role_overrides)
     if not discovered:
         return default_station()
     order = {"local": 0, "remote": 1}
