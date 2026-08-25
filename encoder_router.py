@@ -22,7 +22,7 @@ handle_tci (TCI -> modell).
 
 import time
 
-from cw_keyer import IambicKeyer, StraightKeyer
+from cw_keyer import DEFAULT_CW_SETTINGS, IambicKeyer, StraightKeyer
 from sidetone import Sidetone
 from panel_functions import DEFAULT_PANEL_MAP, DEFAULT_LED_MAP, DEFAULT_BACKLIGHT
 
@@ -85,6 +85,7 @@ class EncoderRouter:
         self._mon_volume = {}   # radio_key -> senast kända MON_VOLUME (dB), från prime()/eko
         self._mon_restore = {}  # radio_key -> nivå att återställa till efter nyckling
         cw = cw_settings or {}
+        self.cw_macros_delay_ms = cw.get("ptt_cw_delay_ms", DEFAULT_CW_SETTINGS["ptt_cw_delay_ms"])
         output_name = cw.get("sidetone_output_name")
         if output_name is None:
             output_name = _auto_sidetone_output_name()
@@ -456,9 +457,11 @@ class EncoderRouter:
             return 1.0
         return 1.0 + ((n - ACCEL_N0) / ACCEL_SCALE) ** ACCEL_EXP
 
-    def _tune(self, delta):
-        """Stäm den cell encodern står på (öra eller TX)."""
-        ri, rxi, vfo = self.station.encoder_cell()
+    def _tune_cell(self, cell, delta):
+        """Delad tuningkärna: stäm en explicit cell (radio_idx, rx_idx, vfo).
+        Används både av _tune() (encoderns aktuella cell) och tune_cell()
+        (en cell utpekad utifrån, t.ex. av scrollhjulet över en frekvensruta)."""
+        ri, rxi, vfo = cell
         radio = self.station.radios[ri]
         rx = radio.rx[rxi]
         base = rx.freq[vfo]
@@ -468,6 +471,38 @@ class EncoderRouter:
         sign = 1 if delta > 0 else -1
         per = min(BASE_STEP * self._step_per_detent(n), ACCEL_PER_MAX)
         new = int(base) + sign * int(round(n * per))
+        rx.freq[vfo] = new
+        self._guard(("vfo", radio.key, rxi, vfo), new)
+        self._send(radio.key, "VFO:%d,%d,%d;" % (rxi, vfo, new))
+        return True
+
+    def _tune(self, delta):
+        """Stäm den cell encodern står på (öra eller TX)."""
+        return self._tune_cell(self.station.encoder_cell(), delta)
+
+    def tune_cell(self, cell, delta):
+        """Stäm en explicit cell oberoende av encoderns aktuella val (t.ex.
+        scrollhjulet över en frekvensruta). Rör inte encoder_on/ear/tx -
+        bara cellens frekvens, precis som _tune() gör for encoderns cell."""
+        if not self._valid(cell):
+            return False
+        return self._tune_cell(cell, delta)
+
+    def tune_cell_by(self, cell, step_hz):
+        """Stäm en explicit cell med ett EXAKT Hz-steg, utan accelerations-
+        kurvan _tune()/_tune_cell() använder. Egen, medvetet separat modell
+        för positionsberoende scroll (vilken siffra muspekaren står på
+        bestämmer step_hz i tcisync.py) - delar bara guard/send-vägen med
+        vred-tuningen, inte accelerationslogiken."""
+        if not self._valid(cell):
+            return False
+        ri, rxi, vfo = cell
+        radio = self.station.radios[ri]
+        rx = radio.rx[rxi]
+        base = rx.freq[vfo]
+        if base is None:
+            return False
+        new = int(base) + int(step_hz)
         rx.freq[vfo] = new
         self._guard(("vfo", radio.key, rxi, vfo), new)
         self._send(radio.key, "VFO:%d,%d,%d;" % (rxi, vfo, new))
@@ -552,7 +587,8 @@ class EncoderRouter:
         radio = self.station.by_key(radio_key)
         if radio is None:
             return
-        cmds = ["CW_KEYER_SPEED;", "CW_MACROS_SPEED;", "MON_VOLUME;", "VOLUME;"]
+        cmds = ["CW_KEYER_SPEED;", "CW_MACROS_SPEED;", "MON_VOLUME;", "VOLUME;",
+                "CW_MACROS_DELAY:%d;" % self.cw_macros_delay_ms]
         for rxi in range(radio.rx_count):
             cmds += ["VFO:%d,0;" % rxi, "VFO:%d,1;" % rxi,
                      "RIT_OFFSET:%d;" % rxi, "RIT_ENABLE:%d;" % rxi,

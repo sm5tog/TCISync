@@ -38,7 +38,7 @@ from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 
-VERSION = "0.15.0"
+VERSION = "0.17.0"
 
 # Inuti en PyInstaller-frozen .exe pekar __file__ INTE på .exe-filens egen
 # mapp (bundlens interna extraktionsmapp) - settings/panel-mappning/LED-
@@ -136,6 +136,8 @@ class Cockpit:
         self.cellouter = {}     # -> CTkFrame (öra-ring + storlek)
         self.cellinner = {}     # -> CTkFrame (TX-ring + hörs-nu-fyllning)
         self.dots = []          # (dot_widget, radio_key) per panel
+        self._wheel_cell = {}    # widget (outer/inner/lbl) -> (radio_key, rx_idx, vfo), för scrollhjulet
+        self._freq_char_w = None  # tecken-bredd (px) i f_freq - cachad vid första scrollet
 
         # Render-cache: senast satta värde per widget så .configure bara körs vid ändring
         # (ctk .configure ritar om en canvas varje gång -> annars omritningsstorm).
@@ -303,6 +305,11 @@ class Cockpit:
         # frekvenscellernas egen Button-3 (TX-markör, se _rx_panel) fortsätter
         # fungera som idag.
         self.root.bind("<Button-3>", self._on_win_menu)
+        # Scrollhjul över en frekvenscell: EN global bindning (bind_all krävs
+        # för tillförlitlig leverans på Windows oavsett vilken av de tre
+        # nästlade cell-widgetsen som råkar ha fokus), cellen slås upp direkt
+        # via event.widget i self._wheel_cell (se _rx_panel/_on_wheel).
+        self.root.bind_all("<MouseWheel>", self._on_wheel)
         for i, slot in enumerate(self.slots):
             self._rx_panel(wrap, slot, i)
             wrap.columnconfigure(i, weight=1)
@@ -369,6 +376,25 @@ class Cockpit:
                 # (_on_win_menu, se _build_ui) - annars öppnas fönstermenyn OCKSÅ
                 # varje gång en cells TX-markör sätts med högerklick.
                 w.bind("<Button-3>", lambda e, k=key: self._cell_click(k, "tx") or "break")
+                # Scrollhjul: widget -> cell-uppslagning (self._wheel_cell), läst
+                # via event.widget i _on_wheel (en enda global <MouseWheel>-
+                # bindning, se _build_ui). event.widget är ALLTID den widget som
+                # faktiskt tog emot händelsen - ingen separat hover-state att
+                # hålla synkad mellan Enter/Leave och scrollet.
+                # OBS: CustomTkinters .bind() delegerar internt till en dold
+                # self._canvas (CTkCanvas) - se ctk_frame.py/ctk_label.py -
+                # så det ÄR _canvas-instansen som faktiskt tar emot händelsen,
+                # inte outer/inner/lbl-wrapperobjekten. Nyckeln måste därför
+                # vara w._canvas, annars missar uppslagningen alltid.
+                self._wheel_cell[w._canvas] = key
+            # CTkLabel lägger dessutom en egen, obunden tkinter.Label (self._label,
+            # se ctk_label.py) OVANPÅ sin canvas, centrerad över exakt den yta där
+            # siffrorna syns - precis där man naturligt scrollar. Ingen egen
+            # .bind() behövs (root.bind_all fångar den ändå, se _build_ui) -
+            # den behöver bara finnas i uppslagningstabellen, annars missar
+            # scrollet varje gång pekaren står på själva siffrorna i stället
+            # för cellens bakgrund/kant.
+            self._wheel_cell[lbl._label] = key
 
         split_btn = ctk.CTkButton(f, text="Split", font=self.f_btn,
                                   height=th.METRICS["btn_height"],
@@ -384,6 +410,60 @@ class Cockpit:
         cell = (self.station.index_of(radio_key), rxi, vfo)
         dirty = self.router.set_ear(cell) if which == "ear" else self.router.set_tx(cell)
         if dirty:
+            self._refresh()
+
+    def _digit_step_hz(self, key, lbl, event):
+        """Räknar ut platsvärdet (i Hz) för siffran under muspekaren i en
+        frekvenscell, t.ex. "14.074.500" -> 100 om pekaren står på "5".
+        f_freq är Consolas (monospace, se ee_theme.py FONT["freq_family"]) -
+        varje tecken (siffra ELLER punkt) har exakt samma bredd, vilket gör
+        pixel->tecken-mappningen till en ren division i stället för en
+        kumulativ font.measure()-sökning över delsträngar (hade krävts för
+        ett proportionellt typsnitt).
+
+        Läser text_root_x relativt lbl (inte event.widget) så resultatet blir
+        korrekt oavsett vilken av de tre nästlade widgetsen (outer/inner/lbl)
+        som faktiskt tog emot händelsen."""
+        text = self._cell_text.get(key) or lbl.cget("text")
+        if not text or not any(c.isdigit() for c in text):
+            return None
+        if self._freq_char_w is None:
+            self._freq_char_w = self.f_freq.measure("0")
+        char_w = self._freq_char_w
+        if char_w <= 0:
+            return None
+        text_w = len(text) * char_w
+        text_start = (lbl.winfo_width() - text_w) / 2.0
+        rel_x = event.x_root - lbl.winfo_rootx()
+        idx = int((rel_x - text_start) // char_w)
+        idx = max(0, min(len(text) - 1, idx))
+        while idx > 0 and not text[idx].isdigit():
+            idx -= 1
+        if not text[idx].isdigit():
+            return None
+        digits_right = sum(1 for c in text[idx + 1:] if c.isdigit())
+        return 10 ** digits_right
+
+    def _on_wheel(self, event):
+        """Global <MouseWheel>-lyssnare (bunden en gång, se _build_ui).
+        event.widget + self._wheel_cell ger cellen direkt, inget separat
+        hover-tillstånd att hålla synkat. Positionsberoende steglängd, INGEN
+        acceleration (designbeslut) - scrollriktningen avgör bara tecknet,
+        siffran under pekaren avgör stegets storlek. Ear/tx/split rörs inte,
+        egen tuningväg (tune_cell_by) skild från E-Coderns _tune()."""
+        key = self._wheel_cell.get(event.widget)
+        if key is None:
+            return
+        lbl = self.cells.get(key)
+        if lbl is None:
+            return
+        step_hz = self._digit_step_hz(key, lbl, event)
+        if step_hz is None:
+            return
+        radio_key, rxi, vfo = key
+        cell = (self.station.index_of(radio_key), rxi, vfo)
+        step = step_hz if event.delta > 0 else -step_hz
+        if self.router.tune_cell_by(cell, step):
             self._refresh()
 
     def _on_split(self, radio_key, rxi):
@@ -1064,6 +1144,7 @@ class Cockpit:
         win.attributes("-topmost", True)
 
         vars_by_key = {}
+        role_vars_by_key = {}
         for i, r in enumerate(self.station.radios):
             ctk.CTkLabel(win, text="%s (%s)" % (r.place, r.key)).grid(
                 row=i, column=0, padx=8, pady=(10 if i == 0 else 4, 4), sticky="w")
@@ -1071,21 +1152,33 @@ class Cockpit:
             vars_by_key[r.key] = var
             ctk.CTkEntry(win, textvariable=var, width=160).grid(
                 row=i, column=1, padx=8, pady=(10 if i == 0 else 4, 4))
+            role_var = tk.StringVar(value=r.place)
+            role_vars_by_key[r.key] = role_var
+            ctk.CTkOptionMenu(win, variable=role_var, values=["local", "remote"],
+                               width=100).grid(
+                row=i, column=2, padx=8, pady=(10 if i == 0 else 4, 4))
 
-        ctk.CTkLabel(win, text="Takes effect after restart.",
-                     text_color=th.color("text_secondary")).grid(
-            row=len(self.station.radios), column=0, columnspan=2, padx=8, pady=(0, 8))
+        ctk.CTkLabel(win, text=("Role: fix a wrong auto-detected Local/Remote "
+                                 "(happens if ExpertSDR3's profile files are "
+                                 "stale, see README). Takes effect after restart."),
+                     text_color=th.color("text_secondary"), wraplength=320,
+                     justify="left").grid(
+            row=len(self.station.radios), column=0, columnspan=3, padx=8, pady=(0, 8))
 
         def on_ok():
             d = load_settings()
             names = d.get("station_names", {})
+            overrides = d.get("role_overrides", {})
             for key, var in vars_by_key.items():
                 val = var.get().strip()
                 if val:
                     names[key] = val
+            for key, role_var in role_vars_by_key.items():
+                overrides[key] = role_var.get()
             d["station_names"] = names
+            d["role_overrides"] = overrides
             save_settings(d)
-            self._log("Station names: saved - restart to apply")
+            self._log("Station names/roles: saved - restart to apply")
             win.destroy()
 
         btns = ctk.CTkFrame(win, fg_color="transparent")
