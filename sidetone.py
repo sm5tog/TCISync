@@ -96,16 +96,34 @@ class Sidetone:
         self._target = 0.0
         self._stream = None
         self._buf = np.empty(BLOCKSIZE, dtype=np.float32)   # återanvänd - ingen allokering per callback
+        self._sr = SAMPLE_RATE
+        dev = _low_latency_output_device(output_name)
+        # WASAPI i delat läge kräver enhetens EGEN mix-frekvens. Anta inte 44100 -
+        # prova enhetens default först, sedan de vanliga, annars tyst (PaErrorCode -9997).
+        candidates = []
         try:
-            stream = sd.OutputStream(
-                device=_low_latency_output_device(output_name),
-                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                callback=self._callback, blocksize=BLOCKSIZE, latency="low")
-            stream.start()
-            self._stream = stream
-        except Exception as e:
+            candidates.append(int(round(sd.query_devices(dev)["default_samplerate"])))
+        except Exception:
+            pass
+        for r in (48000, 44100, 96000):
+            if r not in candidates:
+                candidates.append(r)
+        for rate in candidates:
+            try:
+                stream = sd.OutputStream(
+                    device=dev, samplerate=rate, channels=1, dtype="float32",
+                    callback=self._callback, blocksize=BLOCKSIZE, latency="low")
+                stream.start()
+                self._stream = stream
+                self._sr = rate
+                if rate != SAMPLE_RATE:
+                    self._log("Sidetone: audio output opened at %d Hz" % rate)
+                break
+            except Exception as e:
+                last_err = e
+        if self._stream is None:
             self._log("Sidetone: could not open audio output (%s) - "
-                       "no local CW sidetone until restart" % e)
+                       "no local CW sidetone until restart" % last_err)
 
     def on(self):
         with self._lock:
@@ -150,10 +168,10 @@ class Sidetone:
         with self._lock:
             target = self._target
             amp = self._amp
-        ramp_n = max(1, int(SAMPLE_RATE * self.ramp_ms / 1000))
+        ramp_n = max(1, int(self._sr * self.ramp_ms / 1000))
         step = 1.0 / ramp_n
         phase = self._phase
-        two_pi_f = 2 * math.pi * self.freq_hz / SAMPLE_RATE
+        two_pi_f = 2 * math.pi * self.freq_hz / self._sr
 
         k = np.arange(frames, dtype=np.float64)
         if target > amp:
