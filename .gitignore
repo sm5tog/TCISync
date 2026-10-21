@@ -9,3 +9,5 @@ build/
 dist/
 CLAUDE.md
 DOCUMENTATION.md
+*.log
+TODO.md

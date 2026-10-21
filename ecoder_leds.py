@@ -27,6 +27,12 @@ class LedController:
         self.hid = hid
         self._last = None
 
+    def rebind(self, hid):
+        """Use a freshly opened handle (after a reconnect) and force the next
+        set() to write the LED state again."""
+        self.hid = hid
+        self._last = None
+
     def set(self, left=False, right=False, center=False, backlight=False):
         """Writes the LED state. No-op (no HID write) if unchanged since the
         last call, so this is cheap to call every pump tick."""

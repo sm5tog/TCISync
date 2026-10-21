@@ -21,6 +21,7 @@ import json
 import queue
 import subprocess
 import threading
+import time
 import tkinter as tk
 import urllib.request
 import webbrowser
@@ -38,7 +39,9 @@ from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 
-VERSION = "0.17.2"
+VERSION = "0.17.3"
+HID_RETRY_S = 2.0      # E-Coder reopen interval after a lost connection
+HID_SILENCE_S = 3.0    # no HID report for this long = dead handle
 
 # Inuti en PyInstaller-frozen .exe pekar __file__ INTE på .exe-filens egen
 # mapp (bundlens interna extraktionsmapp) - settings/panel-mappning/LED-
@@ -282,13 +285,56 @@ class Cockpit:
         self.leds = LedController(hid)
         threading.Thread(target=self._reader_loop, daemon=True).start()
 
+    def _hid_log(self, text):
+        """HID connection events go to tcisync_hid.log (pythonw has no console)."""
+        line = "%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), text)
+        self._log(line)
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "tcisync_hid.log"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    def _reconnect_hid(self):
+        """Retry opening the E-Coder every HID_RETRY_S until it works or the
+        app closes, then hand the new handle to the LED controller."""
+        old = self.hid
+        try:
+            old.close()
+        except Exception:
+            pass
+        while not self.stop_flag.wait(HID_RETRY_S):
+            hid = EcoderHid()
+            try:
+                hid.open()
+            except OSError as e:
+                self._hid_log("E-Coder reopen failed: %s" % e)
+                continue
+            self.hid = hid
+            if self.leds:
+                self.leds.rebind(hid)
+            self._hid_log("E-Coder reconnected")
+            return
+
     def _reader_loop(self):
+        # The panel streams ~500 reports/s even at rest, so HID_SILENCE_S
+        # without a report means the handle is dead.
+        last_rx = time.monotonic()
         while not self.stop_flag.is_set():
             try:
                 r = self.hid.read(150)
-            except OSError:
-                break
+                if r is None and time.monotonic() - last_rx > HID_SILENCE_S:
+                    raise OSError("no reports for %d s" % HID_SILENCE_S)
+            except OSError as e:
+                if self.stop_flag.is_set():
+                    break
+                self._hid_log("E-Coder connection lost: %s" % e)
+                self._reconnect_hid()
+                last_rx = time.monotonic()
+                continue
             if r is not None:
+                last_rx = time.monotonic()
                 for key, kind, value in self.decoder.feed(r):
                     self.events.put({"src": "panel", "key": key,
                                      "kind": kind, "value": value})
