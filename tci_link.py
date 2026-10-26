@@ -27,6 +27,15 @@ class TciLink:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        self.raw_listeners = []             # callbacks (radio_key, msg) för varje mottaget meddelande (str eller bytes)
+        self.hello = []                     # textmeddelanden fram till och med 'ready;' vid senaste anslutningen
+
+    def _notify_raw(self, msg):
+        for cb in list(self.raw_listeners):
+            try:
+                cb(self.key, msg)
+            except Exception:
+                pass
 
     def start(self):
         self.stop()
@@ -54,6 +63,7 @@ class TciLink:
                                                  timeout=3)
                 with self._lock:
                     self._ws = ws
+                self.hello = []
                 self._wait_ready(ws)
                 if self._stop.is_set():
                     break
@@ -67,6 +77,9 @@ class TciLink:
                         continue
                     if not msg:
                         break
+                    self._notify_raw(msg)
+                    if isinstance(msg, bytes):
+                        continue            # binärt strömblock (ljud), inget kommando att tolka
                     # En split per recv (inte en repeterad "in"-scan + split
                     # per hittat kommando) - sista elementet är ett ev.
                     # ofullständigt fragment, sparas till nästa recv.
@@ -95,7 +108,11 @@ class TciLink:
         try:
             while time.time() < deadline:
                 ws.settimeout(max(0.05, deadline - time.time()))
-                if "ready;" in ws.recv():
+                msg = ws.recv()
+                if isinstance(msg, bytes):
+                    continue
+                self.hello.append(msg)
+                if "ready;" in msg.lower():
                     break
         except Exception:
             pass
@@ -116,6 +133,20 @@ class TciLink:
                 return False
             try:
                 ws.send(cmd)
+                return True
+            except Exception:
+                self._ws = None
+        self._emit(kind="status", connected=False)
+        return False
+
+    def send_binary(self, data):
+        """Skickar ett binärt strömblock (TX-ljud). Samma lås som send()."""
+        with self._lock:
+            ws = self._ws
+            if ws is None:
+                return False
+            try:
+                ws.send_binary(data)
                 return True
             except Exception:
                 self._ws = None

@@ -39,6 +39,12 @@ class Sync:
         self.sync_rit = False               # RIT_ENABLE/RIT_OFFSET
         self.sync_filter = False            # RX_FILTER_BAND
 
+    def ignore_echo(self, radio_key, name, args):
+        """Någon annan del av programmet (WSJT-bron) skickade just detta kommando till radion.
+        Radions eko av det ska inte reläas av synken (annars kan bronas frekvens ändra den andra
+        radions RX1). Samma eko-spärr som synkens egna relän."""
+        self._guard[(radio_key, name, tuple(args))] = time.time()
+
     def _other(self, source_key):
         for r in self.station.radios:
             if r.key != source_key:

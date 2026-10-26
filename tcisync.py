@@ -35,11 +35,15 @@ from tci_link import TciLink
 from encoder_router import EncoderRouter
 from audio import AudioSwitch
 from sync import Sync
+from tci_bridge import TciBridge, DEFAULT_PORT as BRIDGE_DEFAULT_PORT
+from bridge_router import Mapping
 from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 
-VERSION = "0.17.3"
+VERSION = "0.19.2"
+# WSJT-bron: de fyra lägena (RX-cell, TX-cell). "ramnas" = lokala radions RX2, "blecket" = fjärrradions RX1.
+BRIDGE_MODES = [("ramnas", "ramnas"), ("blecket", "blecket"), ("ramnas", "blecket"), ("blecket", "ramnas")]
 HID_RETRY_S = 2.0      # E-Coder reopen interval after a lost connection
 HID_SILENCE_S = 3.0    # no HID report for this long = dead handle
 
@@ -190,6 +194,15 @@ class Cockpit:
             link = TciLink(r.key, r.ip, r.port, self.events, name=r.name)
             self.links[r.key] = link
             link.start()
+
+        bridge_cfg = load_settings().get("wsjt_bridge", {})
+        self._bridge_rx = bridge_cfg.get("rx", "ramnas")      # "ramnas" (lokala radions RX2) | "blecket" (fjärrradions RX1)
+        self._bridge_tx = bridge_cfg.get("tx", "ramnas")
+        self.bridge = TciBridge(self.links, self._bridge_mapping, log=self._bridge_log,
+                                port=int(bridge_cfg.get("port", BRIDGE_DEFAULT_PORT)),
+                                echo_guard=self.sync.ignore_echo)
+        if bridge_cfg.get("enabled"):
+            self._bridge_start()
 
         self._start_hid()
 
@@ -560,6 +573,23 @@ class Cockpit:
         # Skapas men packas INTE in - visas bara om _show_update_available
         # faktiskt hittar en nyare version (se _check_for_update), samma
         # mönster som jtspots "Uppdatering"-knapp.
+        # WSJT-bron: fyra lägesknappar (RX>TX) som visas när bron är påslagen. Aktivt läge blå,
+        # grön när WSJT-X är ansluten, röd under sändning. Packas först av _bridge_ui_tick.
+        self.bridge_frame = ctk.CTkFrame(bar, fg_color="transparent")
+        ctk.CTkLabel(self.bridge_frame, text="WSJT RX>TX", font=self.f_status,
+                     text_color=th.color("text_secondary")).pack(side="left", padx=(0, 4))
+        self.bridge_btns = []
+        for rx_id, tx_id in BRIDGE_MODES:
+            b = ctk.CTkButton(self.bridge_frame, text="", font=self.f_btn, width=64,
+                              height=th.METRICS["btn_height"],
+                              corner_radius=th.METRICS["radius"],
+                              fg_color=th.color("btn_idle_bg"),
+                              hover_color=th.color("btn_hover_bg"),
+                              text_color=th.color("btn_text"),
+                              command=lambda r=rx_id, t=tx_id: self._on_bridge_mode(r, t))
+            b.pack(side="left", padx=2)
+            self.bridge_btns.append(b)
+
         self.update_btn = ctk.CTkButton(bar, text="", font=self.f_btn,
                                         height=th.METRICS["btn_height"],
                                         corner_radius=th.METRICS["radius"],
@@ -567,6 +597,96 @@ class Cockpit:
                                         hover_color=th.color("accent_blue_bright"),
                                         text_color=th.color("btn_text"),
                                         command=self._launch_updater)
+
+    # ----- WSJT-bro -------------------------------------------------------------
+    def _bridge_cells(self):
+        """{'ramnas': (radio_key, rx_idx), 'blecket': (radio_key, rx_idx)} efter roll, inte namn:
+        Ramnäs = lokala radions RX2, Blecket = fjärrradions RX1. Bron rör aldrig lokala RX1.
+        Saknas en radio (eller lokala radions RX2) saknas dess post."""
+        cells = {}
+        for r in self.station.radios:
+            if r.place == "local" and r.rx_count >= 2:
+                cells["ramnas"] = (r.key, 1)
+            elif r.place == "remote":
+                cells["blecket"] = (r.key, 0)
+        return cells
+
+    def _bridge_mapping(self):
+        c = self._bridge_cells()
+        rx, tx = c[self._bridge_rx], c[self._bridge_tx]
+        return Mapping(rx[0], rx[1], tx[0], tx[1])
+
+    def _bridge_station_name(self, cell_id):
+        key = self._bridge_cells().get(cell_id, (None,))[0]
+        radio = self.station.by_key(key) if key else None
+        return radio.name if radio else cell_id
+
+    def _on_bridge_mode(self, rx_id, tx_id):
+        if self.bridge.ptt_active:
+            self._bridge_log("WSJT bridge: mode change ignored during transmission")
+            return
+        cells = self._bridge_cells()
+        if rx_id not in cells or tx_id not in cells:
+            return
+        self._bridge_rx, self._bridge_tx = rx_id, tx_id
+        d = load_settings()
+        cfg = d.get("wsjt_bridge", {})
+        cfg.update({"rx": rx_id, "tx": tx_id})
+        d["wsjt_bridge"] = cfg
+        save_settings(d)
+        self._bridge_log("WSJT bridge: RX %s, TX %s" % (rx_id, tx_id))
+        self.bridge.on_mapping_changed()
+        self._bridge_ui_tick()
+
+    def _bridge_log(self, text):
+        """Bryggans händelser till tcisync_bridge.log bredvid skriptet (pythonw har ingen konsol)."""
+        line = "%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), text)
+        self._log(line)
+        try:
+            with open(os.path.join(_BASE_DIR, "tcisync_bridge.log"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    def _bridge_start(self):
+        cells = self._bridge_cells()
+        if len(cells) < 2:
+            self._bridge_log("WSJT bridge: needs a local radio with two receivers and a remote radio")
+            return
+        if self._bridge_rx not in cells or self._bridge_tx not in cells:
+            self._bridge_rx = self._bridge_tx = "ramnas"
+        try:
+            self.bridge.start()
+        except OSError as e:
+            self._log("WSJT bridge: cannot listen on port %d: %s" % (self.bridge.port, e))
+            return
+        self._bridge_ui_tick()
+
+    def _bridge_stop(self):
+        self.bridge.stop()
+        self._bridge_ui_tick()
+
+    def _bridge_ui_tick(self):
+        """Uppdaterar lägesknapparna i synk-stripan, 4 ggr/s så länge bron är på."""
+        if getattr(self, "_bridge_tick_id", None) is not None:
+            self.root.after_cancel(self._bridge_tick_id)
+            self._bridge_tick_id = None
+        if not self.bridge.running:
+            self.bridge_frame.pack_forget()
+            return
+        if self.bridge.ptt_active:
+            active_col = self._c_txred
+        elif self.bridge.client_connected:
+            active_col = self._c_green
+        else:
+            active_col = th.color("accent_blue")
+        for b, (rx_id, tx_id) in zip(self.bridge_btns, BRIDGE_MODES):
+            txt = "%s>%s" % (self._bridge_station_name(rx_id)[:3], self._bridge_station_name(tx_id)[:3])
+            on = (rx_id, tx_id) == (self._bridge_rx, self._bridge_tx)
+            b.configure(text=txt, fg_color=active_col if on else th.color("btn_idle_bg"))
+        if not self.bridge_frame.winfo_ismapped():
+            self.bridge_frame.pack(side="right", padx=(0, 8), pady=4)
+        self._bridge_tick_id = self.root.after(250, self._bridge_ui_tick)
 
     def _on_ontop_toggle(self):
         self.ontop = not self.ontop
@@ -832,6 +952,7 @@ class Cockpit:
         menu.add_command(label="LEDs...", command=self._open_led_settings)
         menu.add_command(label="View...", command=self._open_ui_mode_settings)
         menu.add_command(label="Station names...", command=self._open_station_names)
+        menu.add_command(label="WSJT bridge...", command=self._open_bridge_settings)
         menu.add_separator()
         menu.add_command(label="About...", command=self._open_about)
         menu.add_separator()
@@ -1232,6 +1353,49 @@ class Cockpit:
         ctk.CTkButton(btns, text="OK", width=90, command=on_ok).pack(side="left", padx=4)
         ctk.CTkButton(btns, text="Cancel", width=90, command=win.destroy).pack(side="left", padx=4)
 
+    def _open_bridge_settings(self):
+        """WSJT-bron: en lokal TCI-server som WSJT-X ansluter till (TCI Client RX1, localhost:<port>).
+        Lägesknapparna i synk-stripan väljer vilken radio som hörs och vilken som sänder (Ramnäs
+        RX2 eller Blecket RX1). Sparas i tcisync_settings.json under wsjt_bridge."""
+        win = ctk.CTkToplevel(self.root)
+        win.title("WSJT bridge")
+        win.attributes("-topmost", True)
+        cfg = load_settings().get("wsjt_bridge", {})
+        en_var = tk.BooleanVar(value=self.bridge.running)
+        port_var = tk.StringVar(value=str(self.bridge.port))
+        ctk.CTkCheckBox(win, text="Enable WSJT bridge", variable=en_var).grid(
+            row=0, column=0, columnspan=2, padx=12, pady=(12, 6), sticky="w")
+        ctk.CTkLabel(win, text="Port").grid(row=1, column=0, padx=(12, 4), pady=4, sticky="w")
+        ctk.CTkEntry(win, textvariable=port_var, width=80).grid(row=1, column=1, padx=4, pady=4, sticky="w")
+        ctk.CTkLabel(win, text=("In WSJT-X: Settings > Radio > Rig = TCI Client RX1, "
+                                 "network address localhost:<port>. The four mode buttons in the sync "
+                                 "strip choose which radio you hear and which one transmits."),
+                     text_color=th.color("text_secondary"), wraplength=320,
+                     justify="left").grid(row=2, column=0, columnspan=2, padx=12, pady=(4, 8))
+
+        def on_ok():
+            try:
+                port = int(port_var.get())
+            except ValueError:
+                port = int(cfg.get("port", BRIDGE_DEFAULT_PORT))
+            want = en_var.get()
+            if self.bridge.running and (not want or port != self.bridge.port):
+                self._bridge_stop()
+            self.bridge.port = port
+            if want and not self.bridge.running:
+                self._bridge_start()
+            d = load_settings()
+            cfg = d.get("wsjt_bridge", {})
+            cfg.update({"enabled": self.bridge.running, "port": port})
+            d["wsjt_bridge"] = cfg
+            save_settings(d)
+            win.destroy()
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.grid(row=3, column=0, columnspan=2, pady=(0, 10))
+        ctk.CTkButton(btns, text="OK", width=90, command=on_ok).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Cancel", width=90, command=win.destroy).pack(side="left", padx=4)
+
     def _open_about(self):
         """Enda platsen i UI:t där versionsnumret syns i Compact-läge - root.title()
         innehåller det redan (rad ~124), men Compact kör overrideredirect(True)
@@ -1268,6 +1432,7 @@ class Cockpit:
     def _on_close(self):
         self.stop_flag.set()
         self.router.stop()
+        self.bridge.stop()
         for link in self.links.values():
             link.stop()
         if self.leds:
