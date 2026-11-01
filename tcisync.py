@@ -41,9 +41,12 @@ from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 
-VERSION = "0.19.2"
-# WSJT-bron: de fyra lägena (RX-cell, TX-cell). "ramnas" = lokala radions RX2, "blecket" = fjärrradions RX1.
-BRIDGE_MODES = [("ramnas", "ramnas"), ("blecket", "blecket"), ("ramnas", "blecket"), ("blecket", "ramnas")]
+VERSION = "0.20.0"
+# WSJT-bron: två platser. "ramnas" = lokala radions RX2, "blecket" = fjärrradions RX1. Varje plats är
+# RX (grön), TX (röd), RX+TX (orange) eller av (grå); ett klick stegar platsen RX > TX > RX+TX.
+BRIDGE_PLACES = ("ramnas", "blecket")
+BRIDGE_TX_LIVE = "#ff5a5a"      # TX-knappen under pågående sändning (ljusare än vanlig TX-röd)
+BRIDGE_ROLE_TEXT = {"rx": "RX", "tx": "TX", "both": "RX+TX", "off": "-"}
 HID_RETRY_S = 2.0      # E-Coder reopen interval after a lost connection
 HID_SILENCE_S = 3.0    # no HID report for this long = dead handle
 
@@ -573,22 +576,38 @@ class Cockpit:
         # Skapas men packas INTE in - visas bara om _show_update_available
         # faktiskt hittar en nyare version (se _check_for_update), samma
         # mönster som jtspots "Uppdatering"-knapp.
-        # WSJT-bron: fyra lägesknappar (RX>TX) som visas när bron är påslagen. Aktivt läge blå,
-        # grön när WSJT-X är ansluten, röd under sändning. Packas först av _bridge_ui_tick.
+        # WSJT-bron: en knapp per plats (grön RX, röd TX, orange RX+TX, grå av) och två knappar som
+        # kopierar en plats frekvens till den andra. Visas när bron är påslagen, packas först av
+        # _bridge_ui_tick. Pricken i etiketten: grå utan klient, blå när WSJT-X är ansluten.
         self.bridge_frame = ctk.CTkFrame(bar, fg_color="transparent")
-        ctk.CTkLabel(self.bridge_frame, text="WSJT RX>TX", font=self.f_status,
-                     text_color=th.color("text_secondary")).pack(side="left", padx=(0, 4))
-        self.bridge_btns = []
-        for rx_id, tx_id in BRIDGE_MODES:
+        self.bridge_label = ctk.CTkLabel(self.bridge_frame, text="WSJT ●", font=self.f_status,
+                                         text_color=th.color("text_secondary"))
+        self.bridge_label.pack(side="left", padx=(0, 4))
+        self.bridge_place_btns = {}
+        for place in BRIDGE_PLACES:
+            b = ctk.CTkButton(self.bridge_frame, text="", font=self.f_btn, width=64,
+                              height=th.METRICS["btn_height"],
+                              corner_radius=th.METRICS["radius"],
+                              fg_color=th.color("btn_idle_bg"),
+                              hover_color=th.color("btn_idle_bg"),
+                              text_color=th.color("btn_text_on_accent"),
+                              command=lambda p=place: self._on_bridge_place(p))
+            b.pack(side="left", padx=2)
+            self.bridge_place_btns[place] = b
+        ctk.CTkLabel(self.bridge_frame, text="Freq", font=self.f_status,
+                     text_color=th.color("text_secondary")).pack(side="left", padx=(8, 2))
+        self.bridge_copy_btns = {}
+        for src, dst in (("ramnas", "blecket"), ("blecket", "ramnas")):
             b = ctk.CTkButton(self.bridge_frame, text="", font=self.f_btn, width=64,
                               height=th.METRICS["btn_height"],
                               corner_radius=th.METRICS["radius"],
                               fg_color=th.color("btn_idle_bg"),
                               hover_color=th.color("btn_hover_bg"),
                               text_color=th.color("btn_text"),
-                              command=lambda r=rx_id, t=tx_id: self._on_bridge_mode(r, t))
+                              command=lambda s=src, d=dst: self._on_bridge_copy(s, d))
             b.pack(side="left", padx=2)
-            self.bridge_btns.append(b)
+            self.bridge_copy_btns[(src, dst)] = b
+        self._bridge_btn_cache = {}
 
         self.update_btn = ctk.CTkButton(bar, text="", font=self.f_btn,
                                         height=th.METRICS["btn_height"],
@@ -638,6 +657,37 @@ class Cockpit:
         self.bridge.on_mapping_changed()
         self._bridge_ui_tick()
 
+    def _bridge_role(self, place):
+        rx, tx = self._bridge_rx == place, self._bridge_tx == place
+        return "both" if rx and tx else "rx" if rx else "tx" if tx else "off"
+
+    def _on_bridge_place(self, place):
+        """Ett klick stegar platsen RX > TX > RX+TX; den andra platsen blir den som blir över."""
+        other = BRIDGE_PLACES[1] if place == BRIDGE_PLACES[0] else BRIDGE_PLACES[0]
+        rx, tx = {"rx": (other, place), "tx": (place, place),
+                  "both": (place, other), "off": (place, place)}[self._bridge_role(place)]
+        self._on_bridge_mode(rx, tx)
+
+    def _on_bridge_copy(self, src_id, dst_id):
+        """Kopierar frekvensen (och mode) från en plats cell till den andras."""
+        if self.bridge.ptt_active:
+            self._bridge_log("WSJT bridge: frequency copy ignored during transmission")
+            return
+        cells = self._bridge_cells()
+        if src_id not in cells or dst_id not in cells:
+            return
+        (src_key, src_rx), (dst_key, dst_rx) = cells[src_id], cells[dst_id]
+        ok, text = self.bridge.copy_frequency(src_key, src_rx, dst_key, dst_rx)
+        self._bridge_log("WSJT bridge: copy frequency %s > %s: %s%s" % (
+            self._bridge_station_name(src_id), self._bridge_station_name(dst_id),
+            "" if ok else "refused, ", text))
+
+    def _bridge_set(self, key, widget, **kw):
+        """configure() bara när något ändrats (annars blinkar CTkButton vid varje tick)."""
+        if self._bridge_btn_cache.get(key) != kw:
+            self._bridge_btn_cache[key] = dict(kw)
+            widget.configure(**kw)
+
     def _bridge_log(self, text):
         """Bryggans händelser till tcisync_bridge.log bredvid skriptet (pythonw har ingen konsol)."""
         line = "%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), text)
@@ -667,23 +717,26 @@ class Cockpit:
         self._bridge_ui_tick()
 
     def _bridge_ui_tick(self):
-        """Uppdaterar lägesknapparna i synk-stripan, 4 ggr/s så länge bron är på."""
+        """Uppdaterar platsknapparna i synk-stripan, 4 ggr/s så länge bron är på."""
         if getattr(self, "_bridge_tick_id", None) is not None:
             self.root.after_cancel(self._bridge_tick_id)
             self._bridge_tick_id = None
         if not self.bridge.running:
             self.bridge_frame.pack_forget()
             return
-        if self.bridge.ptt_active:
-            active_col = self._c_txred
-        elif self.bridge.client_connected:
-            active_col = self._c_green
-        else:
-            active_col = th.color("accent_blue")
-        for b, (rx_id, tx_id) in zip(self.bridge_btns, BRIDGE_MODES):
-            txt = "%s>%s" % (self._bridge_station_name(rx_id)[:3], self._bridge_station_name(tx_id)[:3])
-            on = (rx_id, tx_id) == (self._bridge_rx, self._bridge_tx)
-            b.configure(text=txt, fg_color=active_col if on else th.color("btn_idle_bg"))
+        self._bridge_set("dot", self.bridge_label, text_color=th.color("accent_blue_bright")
+                         if self.bridge.client_connected else th.color("text_secondary"))
+        colors = {"rx": self._c_green, "tx": BRIDGE_TX_LIVE if self.bridge.ptt_active else self._c_txred,
+                  "both": BRIDGE_TX_LIVE if self.bridge.ptt_active else self._c_orange,
+                  "off": th.color("btn_idle_bg")}
+        for place, b in self.bridge_place_btns.items():
+            role = self._bridge_role(place)
+            self._bridge_set(place, b, text="%s %s" % (self._bridge_station_name(place)[:3],
+                                                       BRIDGE_ROLE_TEXT[role]),
+                             fg_color=colors[role], hover_color=colors[role])
+        for (src, dst), b in self.bridge_copy_btns.items():
+            self._bridge_set((src, dst), b, text="%s>%s" % (self._bridge_station_name(src)[:3],
+                                                            self._bridge_station_name(dst)[:3]))
         if not self.bridge_frame.winfo_ismapped():
             self.bridge_frame.pack(side="right", padx=(0, 8), pady=4)
         self._bridge_tick_id = self.root.after(250, self._bridge_ui_tick)

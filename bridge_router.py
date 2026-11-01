@@ -10,7 +10,9 @@ Bron delar upp det på två radiocellar (se Mapping):
 Varje TCI-kommando tillhör en grupp:
   RX   - bara öra-cellen            (ljudström, S-meter, mute, AGC ...)
   TX   - bara TX-cellen             (PTT, drive, split, XIT, start/stop ...) - även okända kommandon
-  BOTH - båda cellerna              (frekvens VFO A, mode, RIT ...) så dialfrekvensen hamnar på båda
+  BOTH - båda cellerna              (mode, RIT ...)
+WSJT-X kör alltid split: dialen (VFO A) är det man hör och hör till öra-cellen, sändfrekvensen
+(VFO B) och split hör till TX-cellen.
 Klientens mottagarnummer är alltid 0; routern översätter till respektive cells eget
 mottagarnummer, åt båda hållen. Ett annat nummer än 0 från klienten skickas oförändrat.
 """
@@ -21,15 +23,16 @@ Mapping = namedtuple("Mapping", "ear_key ear_rx tx_key tx_rx")
 
 RX_GROUP = {"AUDIO_START", "AUDIO_STOP", "AUDIO_SAMPLERATE", "RX_SMETER", "RX_SENSORS",
             "RX_SENSORS_ENABLE", "RX_CHANNEL_SENSORS", "RX_MUTE", "VOLUME", "MUTE",
-            "SQL_ENABLE", "SQL_LEVEL", "AGC_MODE", "AGC_GAIN", "RX_FILTER_BAND", "RX_ENABLE"}
-BOTH_GROUP = {"VFO", "MODULATION", "DDS", "IF", "RIT_ENABLE", "RIT_OFFSET", "RX_CHANNEL_ENABLE"}
+            "SQL_ENABLE", "SQL_LEVEL", "AGC_MODE", "AGC_GAIN", "RX_FILTER_BAND", "RX_ENABLE",
+            "VFO"}          # VFO kanal 0 (dialen); kanal 1 (VFO B) fångas av CHANNEL_ARG-regeln i group_of
+BOTH_GROUP = {"MODULATION", "DDS", "IF", "RIT_ENABLE", "RIT_OFFSET", "RX_CHANNEL_ENABLE"}
 # Kommandon vars första argument är mottagar-/transceivernumret (resten har bool/dB/Hz först).
 ARG0_RX = {"AUDIO_START", "AUDIO_STOP", "RX_SMETER", "RX_SENSORS", "RX_CHANNEL_SENSORS",
            "RX_MUTE", "SQL_ENABLE", "SQL_LEVEL", "AGC_MODE", "AGC_GAIN", "RX_FILTER_BAND",
            "RX_ENABLE", "VFO", "MODULATION", "DDS", "IF", "RIT_ENABLE", "RIT_OFFSET",
            "RX_CHANNEL_ENABLE", "TRX", "TX_ENABLE", "DRIVE", "TUNE_DRIVE", "TUNE",
            "SPLIT_ENABLE", "XIT_ENABLE", "XIT_OFFSET", "TX_SENSORS", "TX_POWER", "TX_SWR"}
-CHANNEL_ARG = {"VFO", "RX_CHANNEL_ENABLE"}   # args[1] = kanal; kanal 1 (VFO B / split-TX) hör till TX-cellen
+CHANNEL_ARG = {"VFO", "RX_CHANNEL_ENABLE"}   # args[1] = kanal; kanal 1 (VFO B = sändfrekvens) hör till TX-cellen
 
 
 def split_commands(text):
