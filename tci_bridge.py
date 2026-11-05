@@ -20,6 +20,7 @@ samma radio som nycklades. Försvinner klienten under sändning skickas avnyckli
 """
 
 import threading
+import time
 
 import bridge_router as router
 import tci_frames as frames
@@ -56,6 +57,8 @@ class TciBridge:
         self._audio_rate = None         # senaste AUDIO_SAMPLERATE från klienten
         self._both = {}                 # senaste BOTH-kommandon (för omspelning vid cellbyte)
         self._last_map = None
+        self._switch_t = None           # monotonic-tid för senaste cellbyte (för mätning av byteslatens)
+        self._switch_audio_ms = None    # ms från cellbyte till första RX-ljudblocket från nya RX-cellen
 
     # ----- livscykel -----------------------------------------------------------
     def start(self):
@@ -120,6 +123,8 @@ class TciBridge:
             self._sync_audio(m)
             old = self._last_map
             if old is not None and tuple(m) != tuple(old):
+                if (m.ear_key, m.ear_rx) != (old.ear_key, old.ear_rx):
+                    self._switch_t, self._switch_audio_ms = time.monotonic(), None
                 if (m.ear_key, m.ear_rx) != (old.ear_key, old.ear_rx) and self._wsjt["a"]:
                     self._send_radio(m.ear_key, "VFO:%d,0,%s;" % (m.ear_rx, self._wsjt["a"]))
                 if (m.tx_key, m.tx_rx) != (old.tx_key, old.tx_rx):
@@ -138,6 +143,54 @@ class TciBridge:
             self._log("WSJT bridge: TX cell has no VFO B yet (WSJT-X has not sent a TX frequency)")
         if split in ("true", "false"):
             self._send_radio(m.tx_key, "SPLIT_ENABLE:%d,%s;" % (m.tx_rx, split))
+
+    # ----- styrning utifrån (bridge_control.py) -------------------------------------
+    def cell_dial(self, key, rx):
+        """En cells senast kända VFO A i Hz (int), eller None."""
+        with self._lock:
+            v = self._state.get((key, "VFO", str(rx), "0"))
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def rx_dial(self):
+        """RX-cellens senast kända VFO A i Hz (int), eller None."""
+        m = self._map()
+        return self.cell_dial(m.ear_key, m.ear_rx)
+
+    def wsjt_dial(self):
+        """WSJT-X:s dial i Hz (det RX-cellen får vid platsbyte), annars RX-cellens egen."""
+        with self._lock:
+            v = self._wsjt["a"]
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return self.rx_dial()
+
+    def set_companion_dial(self, key, rx, hz):
+        """Sätter VFO A på en cell utanför bronas egna celler (Ramnäs RX1, som styr antennvalet).
+        Bara på begäran från styrgränssnittet; routern släpper aldrig dess eko till WSJT-X och
+        eko-spärren hindrar Sync från att reläa det. Returnerar (ok, text)."""
+        with self._lock:
+            if self._ptt_map is not None:
+                return False, "not during transmission"
+            self._send_radio(key, "VFO:%d,0,%d;" % (int(rx), int(hz)))
+            return True, "%d Hz" % int(hz)
+
+    def set_dial(self, hz):
+        """Sätter RX-cellens VFO A. WSJT-X ser den nya dialen via radions eko, och en RX-cell som
+        tar över vid ett platsbyte får WSJT-X:s dial. Returnerar (ok, text)."""
+        with self._lock:
+            if self._ptt_map is not None:
+                return False, "not during transmission"
+            m = self._map()
+            self._send_radio(m.ear_key, "VFO:%d,0,%d;" % (m.ear_rx, int(hz)))
+            return True, "%d Hz" % int(hz)
+
+    def switch_stats(self):
+        """ms från senaste RX-cellbyte till första RX-ljudblocket därifrån (None = ännu inget)."""
+        return self._switch_audio_ms
 
     # ----- kopiera frekvens -------------------------------------------------------
     def _split_delta(self, src_key, src_rx):
@@ -347,6 +400,8 @@ class TciBridge:
                 t = frames.stream_type(msg)
                 rx = frames.receiver(msg) if t is not None else None
                 if t == frames.RX_AUDIO_STREAM and (radio_key, rx) == (m.ear_key, m.ear_rx):
+                    if self._switch_t is not None and self._switch_audio_ms is None:
+                        self._switch_audio_ms = int((time.monotonic() - self._switch_t) * 1000)
                     conn.send_binary(frames.with_receiver(msg, 0))
                 elif t == frames.TX_CHRONO and (radio_key, rx) == (m.tx_key, m.tx_rx):
                     if self._tx_timing is not None:

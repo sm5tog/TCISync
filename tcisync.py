@@ -37,11 +37,12 @@ from audio import AudioSwitch
 from sync import Sync
 from tci_bridge import TciBridge, DEFAULT_PORT as BRIDGE_DEFAULT_PORT
 from bridge_router import Mapping
+from bridge_control import ControlServer, DEFAULT_PORT as CONTROL_DEFAULT_PORT
 from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 
-VERSION = "0.20.0"
+VERSION = "0.21.2"
 # WSJT-bron: två platser. "ramnas" = lokala radions RX2, "blecket" = fjärrradions RX1. Varje plats är
 # RX (grön), TX (röd), RX+TX (orange) eller av (grå); ett klick stegar platsen RX > TX > RX+TX.
 BRIDGE_PLACES = ("ramnas", "blecket")
@@ -206,6 +207,10 @@ class Cockpit:
                                 echo_guard=self.sync.ignore_echo)
         if bridge_cfg.get("enabled"):
             self._bridge_start()
+        self.control = ControlServer(self._control_request, log=self._bridge_log,
+                                     port=int(bridge_cfg.get("control_port", CONTROL_DEFAULT_PORT)))
+        if bridge_cfg.get("control"):
+            self._control_start()
 
         self._start_hid()
 
@@ -715,6 +720,88 @@ class Cockpit:
     def _bridge_stop(self):
         self.bridge.stop()
         self._bridge_ui_tick()
+
+    # ----- styrgränssnitt för andra program (bridge_control.py) ----------------------
+    def _control_start(self):
+        try:
+            self.control.start()
+        except OSError as e:
+            self._bridge_log("Control interface: cannot listen on port %d: %s" % (self.control.port, e))
+
+    def _control_request(self, req):
+        """Anropas på servertråden. Själva åtgärden körs på GUI-tråden (Tk är inte trådsäkert):
+        servertråden väntar på resultatet, högst 3 s."""
+        done, box = threading.Event(), {}
+
+        def run():
+            try:
+                box["r"] = self._control_exec(req)
+            except Exception as e:
+                box["r"] = {"ok": False, "error": "internal error: %s" % e}
+            finally:
+                done.set()
+
+        self.root.after(0, run)
+        if not done.wait(3.0):
+            return {"ok": False, "error": "GUI busy, try again"}
+        return box["r"]
+
+    def _control_companion(self, place):
+        """Ramnäs RX1 (mottagare 0 på lokala radion): den styr vilken antenn som är inkopplad, medan
+        FT8 går på RX2. Styrgränssnittet håller den på samma frekvens som RX2. Blecket har ingen."""
+        cell = self._bridge_cells().get(place)
+        return (cell[0], 0) if place == "ramnas" and cell else None
+
+    def _control_follow_companion(self, place, hz):
+        comp = self._control_companion(place)
+        if comp is None or not hz:
+            return ""
+        ok, _ = self.bridge.set_companion_dial(comp[0], comp[1], hz)
+        return ", RX1 %s" % ("set" if ok else "refused")
+
+    def _control_exec(self, req):
+        """GUI-tråden. status | set_place | set_dial."""
+        cmd = req.get("cmd")
+        if cmd == "status":
+            comp = self._control_companion("ramnas")
+            return {"ok": True, "version": VERSION, "bridge_running": self.bridge.running,
+                    "client_connected": self.bridge.client_connected, "ptt": self.bridge.ptt_active,
+                    "rx": self._bridge_rx, "tx": self._bridge_tx, "dial_hz": self.bridge.rx_dial(),
+                    "ramnas_rx1_hz": self.bridge.cell_dial(*comp) if comp else None,
+                    "switch_audio_ms": self.bridge.switch_stats(),
+                    "places": sorted(self._bridge_cells())}
+        if not self.bridge.running:
+            return {"ok": False, "error": "WSJT bridge is not running"}
+        if self.bridge.ptt_active:
+            return {"ok": False, "error": "not during transmission"}
+        if cmd in ("set_place", "set_rx"):
+            place = req.get("place")
+            if place not in self._bridge_cells():
+                return {"ok": False, "error": "unknown place %r" % (place,)}
+            hz = req.get("hz")
+            if hz is not None and (not isinstance(hz, int) or isinstance(hz, bool)
+                                   or not 100000 <= hz <= 60000000):
+                return {"ok": False, "error": "hz must be an integer between 100000 and 60000000"}
+            # set_place: RX och TX till platsen. set_rx: bara RX, TX-platsen lämnas orörd.
+            self._on_bridge_mode(place, place if cmd == "set_place" else self._bridge_tx)
+            if hz is not None:
+                self.bridge.set_dial(hz)          # nya RX-cellen, direkt efter bytet (ingen kapplöpning mot ekot)
+            note = self._control_follow_companion(place, hz if hz is not None else self.bridge.wsjt_dial())
+            if note or hz is not None:
+                self._bridge_log("Control interface: %s %s%s%s" % (
+                    cmd, place, " %d Hz" % hz if hz is not None else "", note))
+            return {"ok": True, "rx": self._bridge_rx, "tx": self._bridge_tx}
+        if cmd == "set_dial":
+            hz = req.get("hz")
+            if not isinstance(hz, int) or isinstance(hz, bool) or not 100000 <= hz <= 60000000:
+                return {"ok": False, "error": "hz must be an integer between 100000 and 60000000"}
+            ok, text = self.bridge.set_dial(hz)
+            if ok:
+                text += self._control_follow_companion(self._bridge_rx, hz)
+            self._bridge_log("Control interface: set dial %s: %s%s" % (
+                self._bridge_station_name(self._bridge_rx), "" if ok else "refused, ", text))
+            return {"ok": ok, "text": text} if ok else {"ok": False, "error": text}
+        return {"ok": False, "error": "unknown cmd %r" % (cmd,)}
 
     def _bridge_ui_tick(self):
         """Uppdaterar platsknapparna i synk-stripan, 4 ggr/s så länge bron är på."""
@@ -1425,27 +1512,44 @@ class Cockpit:
                                  "strip choose which radio you hear and which one transmits."),
                      text_color=th.color("text_secondary"), wraplength=320,
                      justify="left").grid(row=2, column=0, columnspan=2, padx=12, pady=(4, 8))
+        ctl_var = tk.BooleanVar(value=self.control.running)
+        cport_var = tk.StringVar(value=str(self.control.port))
+        ctk.CTkCheckBox(win, text="Enable control interface (localhost, for other programs)",
+                        variable=ctl_var).grid(row=3, column=0, columnspan=2, padx=12, pady=(4, 6), sticky="w")
+        ctk.CTkLabel(win, text="Control port").grid(row=4, column=0, padx=(12, 4), pady=4, sticky="w")
+        ctk.CTkEntry(win, textvariable=cport_var, width=80).grid(row=4, column=1, padx=4, pady=4, sticky="w")
 
         def on_ok():
             try:
                 port = int(port_var.get())
             except ValueError:
                 port = int(cfg.get("port", BRIDGE_DEFAULT_PORT))
+            try:
+                cport = int(cport_var.get())
+            except ValueError:
+                cport = int(cfg.get("control_port", CONTROL_DEFAULT_PORT))
             want = en_var.get()
             if self.bridge.running and (not want or port != self.bridge.port):
                 self._bridge_stop()
             self.bridge.port = port
             if want and not self.bridge.running:
                 self._bridge_start()
+            want_ctl = ctl_var.get()
+            if self.control.running and (not want_ctl or cport != self.control.port):
+                self.control.stop()
+            self.control.port = cport
+            if want_ctl and not self.control.running:
+                self._control_start()
             d = load_settings()
             cfg = d.get("wsjt_bridge", {})
-            cfg.update({"enabled": self.bridge.running, "port": port})
+            cfg.update({"enabled": self.bridge.running, "port": port,
+                        "control": self.control.running, "control_port": cport})
             d["wsjt_bridge"] = cfg
             save_settings(d)
             win.destroy()
 
         btns = ctk.CTkFrame(win, fg_color="transparent")
-        btns.grid(row=3, column=0, columnspan=2, pady=(0, 10))
+        btns.grid(row=5, column=0, columnspan=2, pady=(0, 10))
         ctk.CTkButton(btns, text="OK", width=90, command=on_ok).pack(side="left", padx=4)
         ctk.CTkButton(btns, text="Cancel", width=90, command=win.destroy).pack(side="left", padx=4)
 
@@ -1485,6 +1589,7 @@ class Cockpit:
     def _on_close(self):
         self.stop_flag.set()
         self.router.stop()
+        self.control.stop()
         self.bridge.stop()
         for link in self.links.values():
             link.stop()
