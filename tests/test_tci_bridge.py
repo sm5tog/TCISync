@@ -60,7 +60,10 @@ class FakeRadio:
 
     def emit(self, data):
         for c in self.conns:
-            (c.send_binary if isinstance(data, bytes) else c.send_text)(data)
+            try:
+                (c.send_binary if isinstance(data, bytes) else c.send_text)(data)
+            except OSError:                                  # stängd äldre anslutning (radion tappade länken)
+                pass
 
     def stop(self):
         self.server.stop()
@@ -96,6 +99,30 @@ class RouterTest(unittest.TestCase):
         self.assertIsNone(br.radio_message("B", "vfo:1,0,14074000;", m))                       # inte TX-cellens VFO A
         self.assertEqual(br.radio_message("B", "vfo:1,1,14077000;", m), "vfo:0,1,14077000;")   # VFO B från TX-cellen
         self.assertIsNone(br.radio_message("A", "vfo:0,1,14077000;", m))
+
+
+    def test_rx2_client_numbers_are_translated_both_ways(self):
+        m = self.M
+        self.assertEqual(br.client_command("trx:1,true,tci;", m, "1"), [("B", "trx:1,true,tci;")])
+        self.assertEqual(br.client_command("vfo:1,0,14074000;", m, "1"), [("A", "vfo:0,0,14074000;")])
+        self.assertEqual(br.client_command("vfo:1,1,14077000;", m, "1"), [("B", "vfo:1,1,14077000;")])
+        self.assertEqual(br.client_command("modulation:1,digu;", m, "1"),
+                         [("A", "modulation:0,digu;"), ("B", "modulation:1,digu;")])
+        self.assertEqual(br.radio_message("B", "trx:1,false;", m, "1"), "trx:1,false;")
+        self.assertEqual(br.radio_message("A", "vfo:0,0,14074000;", m, "1"), "vfo:1,0,14074000;")
+        self.assertIsNone(br.radio_message("B", "vfo:1,0,14074000;", m, "1"))
+
+    def test_rx_enable_from_client_never_reaches_a_radio(self):
+        for crx in ("0", "1"):
+            self.assertEqual(br.client_command("rx_enable:1,true;", self.M, crx), [])
+            self.assertEqual(br.client_command("rx_enable:0,false;", self.M, crx), [])
+
+    def test_hello_message_gives_each_numbered_command_as_receiver_0_and_1(self):
+        m = br.Mapping("B", 0, "B", 0)
+        self.assertEqual(br.hello_message("B", "vfo:0,0,7074000;modulation:0,digu;device:X;", m),
+                         ["vfo:0,0,7074000;", "vfo:1,0,7074000;", "modulation:0,digu;", "modulation:1,digu;",
+                          "device:X;"])
+        self.assertEqual(br.hello_message("A", "vfo:0,0,7074000;", m), [])
 
 
 class WsServerTest(unittest.TestCase):
@@ -140,8 +167,11 @@ class BridgeTest(unittest.TestCase):
             self.links[key] = link
             link.start()
         self.assertTrue(wait_for(lambda: all(l.hello for l in self.links.values())))
+        self.assertTrue(wait_for(lambda: all(l.connections >= 1 for l in self.links.values())))
+        time.sleep(0.2)                                       # första anslutningens callback är klar
         self.mapping = br.Mapping("A", 0, "B", 1)
         self.bridge = TciBridge(self.links, lambda: self.mapping, port=0)
+        self.bridge.watchdog_s = 60                           # vakten provas i egna tester
         self.bridge.start()
         self.port = self.bridge._server._srv.getsockname()[1]
         self.client = websocket.create_connection("ws://127.0.0.1:%d" % self.port, timeout=3)
@@ -165,6 +195,55 @@ class BridgeTest(unittest.TestCase):
 
     def test_hello_comes_from_tx_radio(self):
         self.assertIn("device:SunSDR2DX;", self.hello)
+
+    def _rx2_client(self):
+        """Ny klient som Rig 'TCI Client RX2' mot mappningen A rx 0 (RX) och B rx 0 (TX)."""
+        self.client.close()
+        self.mapping = br.Mapping("A", 0, "B", 0)
+        self.client = websocket.create_connection("ws://127.0.0.1:%d" % self.port, timeout=3)
+        hello = []
+        while True:
+            m = self.client.recv()
+            hello.append(m)
+            if "ready;" in m:
+                return hello
+
+    def test_hello_tells_the_client_that_receiver_1_is_on(self):
+        self.assertIn("rx_enable:1,true;", self.hello)
+        self.assertEqual(self.hello[-1], "ready;")               # ready; fortfarande sist
+
+    def test_rx2_client_audio_dial_and_ptt(self):
+        self._rx2_client()
+        self.client.send("rx_enable:1,true;")
+        self.assertEqual(self.client.recv(), "rx_enable:1,true;")              # bron svarar själv
+        self.client.send("audio_samplerate:48000;")
+        self.client.send("audio_start:1;")
+        self.assertTrue(wait_for(lambda: "AUDIO_START:0;" in self.a.texts and "AUDIO_START:0;" in self.b.texts))
+        self.client.send("vfo:1,0,14074000;")
+        self.client.send("vfo:1,1,14073000;")
+        self.client.send("trx:1,true,tci;")
+        self.assertTrue(wait_for(lambda: "vfo:0,0,14074000;" in self.a.texts and "vfo:0,1,14073000;" in self.b.texts
+                                 and "trx:0,true,tci;" in self.b.texts))
+        self.assertFalse([t for t in self.a.texts + self.b.texts if t.lower().startswith("rx_enable")])
+        self.a.emit(block(frames.RX_AUDIO_STREAM, 0))
+        got = self.client.recv()
+        self.assertEqual((frames.stream_type(got), frames.receiver(got)), (frames.RX_AUDIO_STREAM, 1))
+        self.a.emit("vfo:0,0,14075000;")
+        self.assertEqual(self.client.recv(), "vfo:1,0,14075000;")
+        self.b.emit("trx:0,false;")
+        self.assertEqual(self.client.recv(), "trx:1,false;")
+
+    def test_rx1_client_is_unchanged_after_an_rx2_client_has_been_served(self):
+        self._rx2_client()
+        self.client.send("vfo:1,0,14074000;")
+        self.assertTrue(wait_for(lambda: "vfo:0,0,14074000;" in self.a.texts))
+        self.client.close()
+        self.mapping = br.Mapping("A", 0, "B", 1)
+        self.client = websocket.create_connection("ws://127.0.0.1:%d" % self.port, timeout=3)
+        while "ready;" not in self.client.recv():
+            pass
+        self.client.send("trx:0,true,tci;")
+        self.assertTrue(wait_for(lambda: "trx:1,true,tci;" in self.b.texts))
 
     def test_audio_and_chrono_routing(self):
         self.client.send("audio_samplerate:48000;")
@@ -246,6 +325,47 @@ class BridgeTest(unittest.TestCase):
         self.b.emit(block(frames.RX_AUDIO_STREAM, 1))
         got = self.client.recv()
         self.assertEqual(frames.stream_type(got), frames.RX_AUDIO_STREAM)
+
+    def test_audio_restarts_when_a_radio_link_reconnects(self):
+        lines = []
+        self.bridge._log = lines.append
+        self.client.send("audio_samplerate:48000;")
+        self.client.send("audio_start:0;")
+        self.assertTrue(wait_for(lambda: "AUDIO_START:0;" in self.a.texts))
+        self.assertTrue(wait_for(lambda: "AUDIO_START:1;" in self.b.texts))
+        self.a.conns[0].close()                                 # radio A tappar länken, TciLink återansluter
+        self.assertTrue(wait_for(lambda: self.a.texts.count("AUDIO_START:0;") == 2, timeout=8))
+        self.assertEqual(self.a.texts.count("AUDIO_SAMPLERATE:48000;"), 2)
+        self.assertEqual(self.b.texts.count("AUDIO_START:1;"), 1)   # radio B rörs inte
+        self.assertTrue(any("radio 'A' connected (connection #2)" in l for l in lines))
+        self.b.emit(block(frames.RX_AUDIO_STREAM, 1))
+        self.a.emit(block(frames.RX_AUDIO_STREAM, 0))
+        got = self.client.recv()
+        self.assertEqual(frames.stream_type(got), frames.RX_AUDIO_STREAM)
+
+
+    def test_audio_watchdog_restarts_silent_stream_but_not_a_running_one(self):
+        lines = []
+        self.bridge._log = lines.append
+        self.bridge.watchdog_s, self.bridge.watchdog_tick_s = 0.5, 0.1
+        self.client.send("audio_samplerate:48000;")
+        self.client.send("audio_start:0;")
+        self.assertTrue(wait_for(lambda: "AUDIO_START:0;" in self.a.texts))
+        end = time.time() + 2.0                                 # ljudet rullar: ingen omstart
+        while time.time() < end:
+            self.a.emit(block(frames.RX_AUDIO_STREAM, 0))
+            self.client.recv()
+            time.sleep(0.05)
+        self.assertEqual(self.a.texts.count("AUDIO_START:0;"), 1)
+        self.assertTrue(wait_for(lambda: self.a.texts.count("AUDIO_START:0;") >= 2, timeout=5))   # tystnad: omstart
+        self.assertEqual(self.b.texts.count("AUDIO_START:1;"), 1)                                   # TX-cellen rörs inte
+        self.assertGreaterEqual(self.a.texts.count("AUDIO_SAMPLERATE:48000;"), 2)
+        self.assertTrue(any("no RX audio from 'A'" in l for l in lines))
+
+    def test_audio_watchdog_is_idle_without_client_audio(self):
+        self.bridge.watchdog_s, self.bridge.watchdog_tick_s = 0.2, 0.05
+        time.sleep(1.0)
+        self.assertFalse([t for t in self.a.texts if t.upper().startswith("AUDIO_START")])
 
 
 class TxTimingTest(unittest.TestCase):

@@ -29,6 +29,15 @@ class TciLink:
         self._thread = None
         self.raw_listeners = []             # callbacks (radio_key, msg) för varje mottaget meddelande (str eller bytes)
         self.hello = []                     # textmeddelanden fram till och med 'ready;' vid senaste anslutningen
+        self.connect_listeners = []         # callbacks (radio_key, anslutningsnummer) efter varje lyckad (åter)anslutning
+        self.connections = 0                # antal lyckade anslutningar sedan start
+
+    def _notify_connected(self):
+        for cb in list(self.connect_listeners):
+            try:
+                cb(self.key, self.connections)
+            except Exception:
+                pass
 
     def _notify_raw(self, msg):
         for cb in list(self.raw_listeners):
@@ -67,7 +76,9 @@ class TciLink:
                 self._wait_ready(ws)
                 if self._stop.is_set():
                     break
+                self.connections += 1
                 self._emit(kind="status", connected=True)
+                self._notify_connected()
                 buf = ""
                 while not self._stop.is_set():
                     ws.settimeout(1.0)

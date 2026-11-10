@@ -13,8 +13,9 @@ Varje TCI-kommando tillhör en grupp:
   BOTH - båda cellerna              (mode, RIT ...)
 WSJT-X kör alltid split: dialen (VFO A) är det man hör och hör till öra-cellen, sändfrekvensen
 (VFO B) och split hör till TX-cellen.
-Klientens mottagarnummer är alltid 0; routern översätter till respektive cells eget
-mottagarnummer, åt båda hållen. Ett annat nummer än 0 från klienten skickas oförändrat.
+Klientens mottagarnummer (crx) är 0 för Rig 'TCI Client RX1' och 1 för 'TCI Client RX2' (0.22.0);
+routern översätter till respektive cells eget mottagarnummer, åt båda hållen. Ett annat nummer
+än crx från klienten skickas oförändrat. RX_ENABLE från klienten skickas aldrig till en radio.
 """
 
 from collections import namedtuple
@@ -62,11 +63,14 @@ def group_of(name, args):
     return "TX"
 
 
-def client_command(text, m):
-    """Ett meddelande från WSJT-X -> lista [(radio_key, kommandotext)] att skicka vidare."""
+def client_command(text, m, crx="0"):
+    """Ett meddelande från WSJT-X -> lista [(radio_key, kommandotext)] att skicka vidare.
+    crx = klientens egna mottagarnummer ("0" = Rig 'TCI Client RX1', "1" = 'TCI Client RX2')."""
     out = []
     for name, args in split_commands(text):
         n = name.upper()
+        if n == "RX_ENABLE":      # bron svarar själv att klientens mottagare är på; skickas aldrig till en radio
+            continue
         g = group_of(name, args)
         targets = []
         if g in ("RX", "BOTH"):
@@ -75,7 +79,7 @@ def client_command(text, m):
             targets.append((m.tx_key, m.tx_rx))
         for key, rx in dict.fromkeys(targets):
             a = list(args)
-            if n in ARG0_RX and a and a[0] == "0":
+            if n in ARG0_RX and a and a[0] == crx:
                 a[0] = str(rx)
             item = (key, format_command(name, a))
             if item not in out:
@@ -83,9 +87,25 @@ def client_command(text, m):
     return out
 
 
-def radio_message(radio_key, text, m):
-    """Ett textmeddelande från en radio -> text till WSJT-X (mottagarnummer översatt till 0),
-    eller None om det inte hör hemma i klientens bild (fel radio eller fel mottagare)."""
+def hello_message(radio_key, text, m):
+    """Hello-text från TX-cellen -> text till WSJT-X, med varje mottagarnumrerat kommando både som
+    mottagare 0 och som mottagare 1, så Rig 'TCI Client RX1' och 'TCI Client RX2' båda hittar sin
+    mottagare. Övriga kommandon går med en gång. Returnerar en lista med ett kommando per element
+    (tom om inget hör hemma i klientens bild)."""
+    out = []
+    for name, args in split_commands(text):
+        single = format_command(name, args)
+        for crx in ("0", "1") if name.upper() in ARG0_RX else ("0",):
+            part = radio_message(radio_key, single, m, crx)
+            if part:
+                out.append(part)
+    return out
+
+
+def radio_message(radio_key, text, m, crx="0"):
+    """Ett textmeddelande från en radio -> text till WSJT-X (mottagarnummer översatt till klientens
+    nummer crx, "0" = RX1 och "1" = RX2), eller None om det inte hör hemma i klientens bild
+    (fel radio eller fel mottagare)."""
     out = []
     for name, args in split_commands(text):
         n = name.upper()
@@ -97,6 +117,6 @@ def radio_message(radio_key, text, m):
         if n in ARG0_RX and a:
             if a[0] != str(src_rx):
                 continue
-            a[0] = "0"
+            a[0] = crx
         out.append(format_command(name, a))
     return "".join(out) or None

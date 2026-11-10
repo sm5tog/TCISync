@@ -29,6 +29,8 @@ from ws_server import WsServer
 
 DEFAULT_PORT = 60001
 SPLIT_DELTA_LIMIT_HZ = 20000                  # större skillnad mellan VFO B och VFO A är ingen split-offset
+AUDIO_WATCHDOG_S = 3.0                        # så länge får RX-ljudet utebli innan AUDIO_START skickas om
+AUDIO_WATCHDOG_TICK_S = 1.0
 CLIENT_LOG_LIMIT = 60                         # antal första klientkommandon per anslutning som loggas
 LOCAL_AUDIO = {"AUDIO_START", "AUDIO_STOP"}   # hanteras av TciBridge._sync_audio, inte av routern
 
@@ -51,6 +53,8 @@ class TciBridge:
         self._server = None
         self._lock = threading.RLock()
         self._client = None
+        self._crx = "0"                 # klientens mottagarnummer: "0" = Rig 'TCI Client RX1', "1" = 'RX2'
+        self._crx_known = False         # klienten har visat vilket nummer den använder
         self._ptt_map = None            # Mapping som gällde när PTT slogs på (None = ingen sändning)
         self._audio_on = False          # klienten har begärt ljudström
         self._audio_cells = set()       # (radio_key, rx) som just nu har audio_start
@@ -59,6 +63,11 @@ class TciBridge:
         self._last_map = None
         self._switch_t = None           # monotonic-tid för senaste cellbyte (för mätning av byteslatens)
         self._switch_audio_ms = None    # ms från cellbyte till första RX-ljudblocket från nya RX-cellen
+        self._audio_ref = time.monotonic()   # senaste RX-ljudblock från RX-cellen, eller senaste AUDIO_START
+        self.watchdog_s = AUDIO_WATCHDOG_S
+        self.watchdog_tick_s = AUDIO_WATCHDOG_TICK_S
+        self._watchdog_stop = threading.Event()
+        self._watchdog_restarts = 0     # antal omstarter i rad utan att ljud kommit (för att inte fylla loggen)
 
     # ----- livscykel -----------------------------------------------------------
     def start(self):
@@ -68,19 +77,25 @@ class TciBridge:
             for text in list(link.hello):
                 self._note_radio_state(key, text, None)
             link.raw_listeners.append(self._on_radio)
+            link.connect_listeners.append(self._on_radio_connected)
         self._server = WsServer(self.host, self.port, self._serve_client, log=self._log)
         self._server.start()
         self._last_map = self._mapping_fn()
+        self._watchdog_stop.clear()
+        threading.Thread(target=self._watchdog_run, daemon=True).start()
         self._log("WSJT bridge: listening on localhost:%d (IPv4 and IPv6 where available)" % self.port)
 
     def stop(self):
         if self._server is None:
             return
+        self._watchdog_stop.set()
         self._server.stop()
         self._server = None
         for link in self.links.values():
             if self._on_radio in link.raw_listeners:
                 link.raw_listeners.remove(self._on_radio)
+            if self._on_radio_connected in link.connect_listeners:
+                link.connect_listeners.remove(self._on_radio_connected)
         with self._lock:
             client = self._client
         if client is not None:
@@ -130,7 +145,7 @@ class TciBridge:
                 if (m.tx_key, m.tx_rx) != (old.tx_key, old.tx_rx):
                     self._apply_tx_setup(m)
                 for name, args in self._both.values():
-                    self._to_radios(router.client_command(router.format_command(name, args), m))
+                    self._to_radios(router.client_command(router.format_command(name, args), m, self._crx))
             self._last_map = m
 
     def _apply_tx_setup(self, m):
@@ -246,7 +261,49 @@ class TciBridge:
             if self._audio_rate:
                 self._send_radio(key, "AUDIO_SAMPLERATE:%s;" % self._audio_rate)
             self._send_radio(key, "AUDIO_START:%d;" % rx)
+            self._audio_ref = time.monotonic()
         self._audio_cells = desired
+
+    def _on_radio_connected(self, radio_key, number):
+        """En radiolänk har (åter)anslutit. Den nya anslutningen har ingen ljudström, så radions
+        celler glöms ur `_audio_cells` och `_sync_audio` startar om dem (annars tror bron att
+        ljudet redan går, medan kommandon fortsätter fungera men ljudet uteblir)."""
+        with self._lock:
+            lost = {c for c in self._audio_cells if c[0] == radio_key}
+            self._log("WSJT bridge: radio '%s' connected (connection #%d), audio %s" % (
+                radio_key, number, "restarted" if lost and self._client is not None else "not needed"))
+            if not lost:
+                return
+            self._audio_cells -= lost
+            if self._client is not None and self._audio_on:
+                self._sync_audio(self._map())
+
+    def _watchdog_run(self):
+        while not self._watchdog_stop.wait(self.watchdog_tick_s):
+            try:
+                self._watchdog_check()
+            except Exception as e:
+                self._log("WSJT bridge: audio watchdog error: %s" % e)
+
+    def _watchdog_check(self):
+        """Vill klienten ha ljud men har inget RX-ljudblock kommit från RX-cellen på `watchdog_s`
+        sekunder, skickas AUDIO_SAMPLERATE och AUDIO_START om. Täcker alla orsaker till en tyst
+        ljudström (radion har glömt strömmen, kommandot gick förlorat), inte bara återanslutning.
+        Loggar de första omstarterna i en följd och sedan var tionde."""
+        with self._lock:
+            if self._client is None or not self._audio_on:
+                return
+            silent = time.monotonic() - self._audio_ref
+            if silent < self.watchdog_s:
+                return
+            m = self._map()
+            self._watchdog_restarts += 1
+            n = self._watchdog_restarts
+            if n <= 3 or n % 10 == 0:
+                self._log("WSJT bridge: no RX audio from '%s' for %.1f s, restarting audio (restart #%d in a row)"
+                          % (m.ear_key, silent, n))
+            self._audio_cells.discard((m.ear_key, m.ear_rx))
+            self._sync_audio(m)
 
     # ----- klientsidan ----------------------------------------------------------
     def _serve_client(self, conn):
@@ -262,6 +319,7 @@ class TciBridge:
             return
         with self._lock:
             self._client = conn
+            self._crx, self._crx_known = "0", False
             self._last_map = m
             self._wsjt = {"a": self._state.get((m.ear_key, "VFO", str(m.ear_rx), "0")),
                           "b": self._state.get((m.tx_key, "VFO", str(m.tx_rx), "1")),
@@ -272,8 +330,9 @@ class TciBridge:
         tx_view = router.Mapping(m.tx_key, m.tx_rx, m.tx_key, m.tx_rx)   # hello = TX-cellens egen bild
         try:
             for text in hello:
-                out = router.radio_message(m.tx_key, text, tx_view)
-                if out:
+                if text.strip().lower().startswith("ready"):
+                    conn.send_text("rx_enable:1,true;")      # bron har en mottagare 1 för Rig 'TCI Client RX2'
+                for out in router.hello_message(m.tx_key, text, tx_view):
                     conn.send_text(self._with_rx_dial(out, m))
             while True:
                 msg = conn.recv()
@@ -297,7 +356,7 @@ class TciBridge:
             return out
         parts = []
         for name, args in router.split_commands(out):
-            if name.upper() == "VFO" and len(args) >= 3 and args[0] == "0" and args[1] == "0":
+            if name.upper() == "VFO" and len(args) >= 3 and args[0] in ("0", "1") and args[1] == "0":
                 args = [args[0], args[1], dial]
             parts.append(router.format_command(name, args))
         return "".join(parts)
@@ -320,15 +379,36 @@ class TciBridge:
     def _on_client_text(self, text):
         with self._lock:
             for name, args in router.split_commands(text):
+                self._learn_client_receiver(name, args)
                 self._track_state(name, args)
                 m = self._map()
+                if name.upper() == "RX_ENABLE" and len(args) >= 2:
+                    self._answer_client("rx_enable:%s,%s;" % (args[0], args[1].lower()))
                 if name.upper() not in LOCAL_AUDIO:       # ljudstart/stopp sköts av _sync_audio
-                    self._to_radios(router.client_command(router.format_command(name, args), m))
+                    self._to_radios(router.client_command(router.format_command(name, args), m, self._crx))
                 if name.upper() == "TRX" and len(args) >= 2 and args[1].lower() == "false":
                     self._finish_tx_timing()
                     self._ptt_map = None
             if self._audio_on or self._audio_cells:
                 self._sync_audio(self._map())
+
+    def _learn_client_receiver(self, name, args):
+        """Första mottagarnumrerade kommandot (utom RX_ENABLE) visar om klienten är Rig 'TCI Client
+        RX1' (nummer 0) eller 'RX2' (nummer 1). Därefter översätts detta nummer åt båda hållen."""
+        if self._crx_known or name.upper() not in router.ARG0_RX or name.upper() == "RX_ENABLE":
+            return
+        if args and args[0] in ("0", "1"):
+            self._crx, self._crx_known = args[0], True
+            self._log("WSJT bridge: client uses receiver %s (Rig 'TCI Client RX%d')" % (args[0], int(args[0]) + 1))
+
+    def _answer_client(self, text):
+        conn = self._client
+        if conn is None:
+            return
+        try:
+            conn.send_text(text)
+        except (ConnectionError, OSError):
+            pass
 
     def _track_state(self, name, args):
         """Det bron behöver minnas om klienten: PTT, ljud, samplingsfrekvens, BOTH-värden,
@@ -345,7 +425,7 @@ class TciBridge:
             self._audio_rate = args[0]
         if router.group_of(name, args) == "BOTH" and len(args) >= 2:
             self._both[(n, args[1] if n in router.CHANNEL_ARG else "")] = (name, args)
-        if n == "VFO" and len(args) >= 3 and args[0] == "0":
+        if n == "VFO" and len(args) >= 3 and args[0] == self._crx:
             if args[1] == "0":
                 self._wsjt["a"] = args[2]
             elif args[1] == "1":
@@ -400,16 +480,18 @@ class TciBridge:
                 t = frames.stream_type(msg)
                 rx = frames.receiver(msg) if t is not None else None
                 if t == frames.RX_AUDIO_STREAM and (radio_key, rx) == (m.ear_key, m.ear_rx):
+                    self._audio_ref = time.monotonic()
+                    self._watchdog_restarts = 0
                     if self._switch_t is not None and self._switch_audio_ms is None:
                         self._switch_audio_ms = int((time.monotonic() - self._switch_t) * 1000)
-                    conn.send_binary(frames.with_receiver(msg, 0))
+                    conn.send_binary(frames.with_receiver(msg, int(self._crx)))
                 elif t == frames.TX_CHRONO and (radio_key, rx) == (m.tx_key, m.tx_rx):
                     if self._tx_timing is not None:
                         self._tx_timing.chrono()
-                    conn.send_binary(frames.with_receiver(msg, 0))
+                    conn.send_binary(frames.with_receiver(msg, int(self._crx)))
             else:
                 self._note_radio_ptt(radio_key, msg, m)
-                out = router.radio_message(radio_key, msg, m)
+                out = router.radio_message(radio_key, msg, m, self._crx)
                 if out:
                     conn.send_text(out)
         except (ConnectionError, OSError):
