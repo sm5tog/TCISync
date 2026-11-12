@@ -38,11 +38,12 @@ from sync import Sync
 from tci_bridge import TciBridge, DEFAULT_PORT as BRIDGE_DEFAULT_PORT
 from bridge_router import Mapping
 from bridge_control import ControlServer, DEFAULT_PORT as CONTROL_DEFAULT_PORT
+from tci_proxy import TciProxy, DEFAULT_PORT as PROXY_DEFAULT_PORT
 from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 
-VERSION = "0.22.0"
+VERSION = "0.24.0"
 # WSJT-bron: två platser. "ramnas" = lokala radions RX2, "blecket" = fjärrradions RX1. Varje plats är
 # RX (grön), TX (röd), RX+TX (orange) eller av (grå); ett klick stegar platsen RX > TX > RX+TX.
 BRIDGE_PLACES = ("ramnas", "blecket")
@@ -211,6 +212,10 @@ class Cockpit:
                                      port=int(bridge_cfg.get("control_port", CONTROL_DEFAULT_PORT)))
         if bridge_cfg.get("control"):
             self._control_start()
+
+        self.proxy = None
+        if load_settings().get("tci_proxy", {}).get("enabled"):
+            self._proxy_start()
 
         self._start_hid()
 
@@ -721,6 +726,110 @@ class Cockpit:
         self.bridge.stop()
         self._bridge_ui_tick()
 
+    # ----- TCI-proxy för andra program, t.ex. Log4OM (tci_proxy.py) -------------------
+    def _proxy_log(self, text):
+        """Proxyns händelser till tcisync_proxy.log bredvid skriptet."""
+        line = "%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), text)
+        self._log(line)
+        try:
+            with open(os.path.join(_BASE_DIR, "tcisync_proxy.log"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    def _proxy_radio(self, cfg):
+        """Radion proxyn går mot: inställningens nyckel, annars den lokala, annars den första."""
+        r = self.station.by_key(cfg.get("radio"))
+        if r is None:
+            r = next((x for x in self.station.radios if x.place == "local"), None)
+        return r or (self.station.radios[0] if self.station.radios else None)
+
+    def _proxy_start(self):
+        """Startar proxyn enligt tci_proxy i tcisync_settings.json (bara en socketbindning,
+        anslutningarna går i egna trådar)."""
+        cfg = load_settings().get("tci_proxy", {})
+        r = self._proxy_radio(cfg)
+        if r is None:
+            self._proxy_log("TCI proxy: no radio found")
+            return
+        traffic = os.path.join(_BASE_DIR, "tcisync_proxy_traffic.log") if cfg.get("log_traffic") else None
+        proxy = TciProxy(r.ip, r.port, port=int(cfg.get("port", PROXY_DEFAULT_PORT)),
+                         log=self._proxy_log, traffic_path=traffic,
+                         only_rx1=bool(cfg.get("only_rx1")))
+        try:
+            proxy.start()
+        except OSError as e:
+            self._proxy_log("TCI proxy: cannot listen on port %d: %s" % (proxy.port, e))
+            return
+        self.proxy = proxy
+
+    def _proxy_stop(self):
+        if self.proxy is not None:
+            self.proxy.stop()
+            self.proxy = None
+
+    def _open_proxy_settings(self):
+        """TCI-proxyn: en port som skickar allt oförändrat till en radio och håller klientens
+        anslutning öppen när radion försvinner. Sparas i tcisync_settings.json under tci_proxy."""
+        win = ctk.CTkToplevel(self.root)
+        win.title("TCI proxy")
+        win.attributes("-topmost", True)
+        cfg = load_settings().get("tci_proxy", {})
+        radios = list(self.station.radios)
+        labels = ["%s (port %d)" % (r.name, r.port) for r in radios]
+        cur = self._proxy_radio(cfg)
+        en_var = tk.BooleanVar(value=self.proxy is not None)
+        port_var = tk.StringVar(value=str(cfg.get("port", PROXY_DEFAULT_PORT)))
+        radio_var = tk.StringVar(value=labels[radios.index(cur)] if cur in radios else (labels or [""])[0])
+        log_var = tk.BooleanVar(value=bool(cfg.get("log_traffic")))
+        ctk.CTkCheckBox(win, text="Enable TCI proxy", variable=en_var).grid(
+            row=0, column=0, columnspan=2, padx=12, pady=(12, 6), sticky="w")
+        ctk.CTkLabel(win, text="Port").grid(row=1, column=0, padx=(12, 4), pady=4, sticky="w")
+        ctk.CTkEntry(win, textvariable=port_var, width=80).grid(row=1, column=1, padx=4, pady=4, sticky="w")
+        ctk.CTkLabel(win, text="Radio").grid(row=2, column=0, padx=(12, 4), pady=4, sticky="w")
+        ctk.CTkOptionMenu(win, variable=radio_var, values=labels or [""]).grid(
+            row=2, column=1, padx=4, pady=4, sticky="w")
+        ctk.CTkCheckBox(win, text="Log traffic (tcisync_proxy_traffic.log)", variable=log_var).grid(
+            row=3, column=0, columnspan=2, padx=12, pady=(4, 6), sticky="w")
+        rx1_var = tk.BooleanVar(value=bool(cfg.get("only_rx1")))
+        ctk.CTkCheckBox(win, text="Show only RX1 to the client (hides RX2)", variable=rx1_var).grid(
+            row=4, column=0, columnspan=2, padx=12, pady=(4, 6), sticky="w")
+        ctk.CTkLabel(win, text=("For programs such as Log4OM: connect to localhost:<port> instead of the "
+                                 "radio's own TCI port. Everything is passed through, and the "
+                                 "connection stays open when ExpertSDR3 restarts. Changing a setting "
+                                 "disconnects the client, restart its CAT afterwards."),
+                     text_color=th.color("text_secondary"), wraplength=320,
+                     justify="left").grid(row=5, column=0, columnspan=2, padx=12, pady=(4, 8))
+
+        def on_ok():
+            try:
+                port = int(port_var.get())
+            except ValueError:
+                port = int(cfg.get("port", PROXY_DEFAULT_PORT))
+            r = radios[labels.index(radio_var.get())] if radio_var.get() in labels else cur
+            wanted = {"port": port, "radio": r.key if r else None, "log_traffic": log_var.get(),
+                      "only_rx1": rx1_var.get()}
+            before = {"port": int(cfg.get("port", PROXY_DEFAULT_PORT)),
+                      "radio": cur.key if cur else None, "log_traffic": bool(cfg.get("log_traffic")),
+                      "only_rx1": bool(cfg.get("only_rx1"))}
+            d = load_settings()
+            new = dict(d.get("tci_proxy", {}), **wanted)
+            d["tci_proxy"] = new
+            save_settings(d)
+            # En omstart kopplar bort anslutna klienter, så den görs bara när något faktiskt ändrats.
+            if self.proxy is not None and (not en_var.get() or wanted != before):
+                self._proxy_stop()
+            if en_var.get() and self.proxy is None:
+                self._proxy_start()
+            d["tci_proxy"]["enabled"] = self.proxy is not None
+            save_settings(d)
+            win.destroy()
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.grid(row=6, column=0, columnspan=2, pady=(0, 10))
+        ctk.CTkButton(btns, text="OK", width=90, command=on_ok).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Cancel", width=90, command=win.destroy).pack(side="left", padx=4)
+
     # ----- styrgränssnitt för andra program (bridge_control.py) ----------------------
     def _control_start(self):
         try:
@@ -1093,6 +1202,7 @@ class Cockpit:
         menu.add_command(label="View...", command=self._open_ui_mode_settings)
         menu.add_command(label="Station names...", command=self._open_station_names)
         menu.add_command(label="WSJT bridge...", command=self._open_bridge_settings)
+        menu.add_command(label="TCI proxy...", command=self._open_proxy_settings)
         menu.add_separator()
         menu.add_command(label="About...", command=self._open_about)
         menu.add_separator()
@@ -1591,6 +1701,7 @@ class Cockpit:
         self.router.stop()
         self.control.stop()
         self.bridge.stop()
+        self._proxy_stop()
         for link in self.links.values():
             link.stop()
         if self.leds:
