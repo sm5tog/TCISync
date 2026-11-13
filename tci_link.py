@@ -105,8 +105,8 @@ class TciLink:
             except Exception as e:
                 hint = ""
                 if isinstance(e, ConnectionRefusedError) or "10061" in str(e):
-                    hint = " - troligen är radion/fjärrstyrningen inte igång"
-                self._emit(kind="log", text="TCI-fel (%s, %s:%d): %s%s" % (self.name, self.ip, self.port, e, hint))
+                    hint = " - the radio or remote control is probably not running"
+                self._emit(kind="log", text="TCI error (%s, %s:%d): %s%s" % (self.name, self.ip, self.port, e, hint))
             with self._lock:
                 self._ws = None
             self._emit(kind="status", connected=False)
