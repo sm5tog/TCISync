@@ -196,6 +196,62 @@ class BridgeTest(unittest.TestCase):
     def test_hello_comes_from_tx_radio(self):
         self.assertIn("device:SunSDR2DX;", self.hello)
 
+    def _new_client_hello(self):
+        client = websocket.create_connection("ws://127.0.0.1:%d" % self.port, timeout=3)
+        hello = []
+        while True:
+            m = client.recv()
+            hello.append(m)
+            if "ready;" in m:
+                break
+        client.close()
+        return hello
+
+    def _drain(self, seconds):
+        """Everything the client receives for a while, as text."""
+        got = []
+        deadline = time.time() + seconds
+        self.client.settimeout(0.1)
+        while time.time() < deadline:
+            try:
+                m = self.client.recv()
+            except Exception:
+                continue
+            if isinstance(m, str):
+                got.append(m)
+        return got
+
+    def test_a_stop_followed_by_start_never_reaches_the_client(self):
+        self.bridge.power_hold_s = 5
+        self.b.emit("stop;")
+        time.sleep(0.2)
+        self.b.emit("start;")
+        got = "".join(self._drain(0.6))
+        self.assertNotIn("stop;", got)
+        self.assertNotIn("start;", got)
+
+    def test_a_stop_without_start_is_passed_on_after_the_hold_time(self):
+        self.bridge.power_hold_s = 0.3
+        self.b.emit("stop;")
+        self.assertNotIn("stop;", "".join(self._drain(0.1)))
+        self.assertIn("stop;", "".join(self._drain(0.8)))
+
+    def test_a_lone_start_is_passed_on(self):
+        self.b.emit("start;")
+        self.assertIn("start;", "".join(self._drain(0.6)))
+
+    def test_hello_follows_a_live_stop_and_start_of_the_tx_radio(self):
+        self.b.emit("stop;")
+        self.assertTrue(wait_for(lambda: "stop;" in self.links["B"].hello))
+        hello = self._new_client_hello()
+        self.assertIn("stop;", hello)                          # WSJT-X must see the radio as stopped, not a stale start;
+        self.assertNotIn("start;", hello)
+        self.b.emit("start;")
+        self.assertTrue(wait_for(lambda: "start;" in self.links["B"].hello))
+        hello = self._new_client_hello()
+        self.assertIn("start;", hello)
+        self.assertNotIn("stop;", hello)
+
     def _rx2_client(self):
         """Ny klient som Rig 'TCI Client RX2' mot mappningen A rx 0 (RX) och B rx 0 (TX)."""
         self.client.close()

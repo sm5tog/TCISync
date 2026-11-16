@@ -44,6 +44,8 @@ class TciBridge:
         self.links = links
         self._mapping_fn = mapping_fn
         self._echo_guard = echo_guard
+        self._held_stop = None          # Timer for a stop; held back from the client (see _power_message)
+        self.power_hold_s = 10.0
         self._tx_timing = None          # TxTiming för pågående sändning (diagnostik)
         self._wsjt = self._empty_wsjt() # WSJT-X:s dial (a), TX-frekvens (b) och split, som text
         self._state = {}                # senast sedda VFO/MODULATION/SPLIT_ENABLE per radio och mottagare
@@ -89,6 +91,10 @@ class TciBridge:
         if self._server is None:
             return
         self._watchdog_stop.set()
+        with self._lock:
+            held, self._held_stop = self._held_stop, None
+        if held is not None:
+            held.cancel()
         self._server.stop()
         self._server = None
         for link in self.links.values():
@@ -490,12 +496,45 @@ class TciBridge:
                         self._tx_timing.chrono()
                     conn.send_binary(frames.with_receiver(msg, int(self._crx)))
             else:
+                if radio_key == m.tx_key and self._power_message(conn, msg):
+                    return
                 self._note_radio_ptt(radio_key, msg, m)
                 out = router.radio_message(radio_key, msg, m, self._crx)
                 if out:
                     conn.send_text(out)
         except (ConnectionError, OSError):
             pass
+
+    def _power_message(self, conn, msg):
+        """True if msg is the radio's own stop; or start; and was dealt with here. A stop; is held back for
+        power_hold_s: a start; within that time (the radio was restarted, e.g. by stationhub) drops both, so WSJT-X
+        never sees the power cycle (it gives up on stop; and needs a new connection). Without a start; the stop; is
+        passed on when the time is up, so a real switch-off still shows."""
+        cmds = router.split_commands(msg)
+        if not cmds or any(name.lower() not in ("start", "stop") or args for name, args in cmds):
+            return False
+        word = cmds[-1][0].lower()
+        with self._lock:
+            held, self._held_stop = self._held_stop, None
+        if held is not None:
+            held.cancel()
+        if word == "stop":
+            def release(c=conn):
+                with self._lock:
+                    if self._held_stop is not timer:
+                        return
+                    self._held_stop = None
+                try:
+                    c.send_text("stop;")
+                except (ConnectionError, OSError):
+                    pass
+            timer = threading.Timer(self.power_hold_s, release)
+            timer.daemon = True
+            with self._lock:
+                self._held_stop = timer
+            timer.start()
+            return True
+        return held is not None          # start; after a held stop;: both dropped. A lone start; goes on as before
 
     def _note_radio_ptt(self, radio_key, msg, m):
         """Radions eget `trx:<rx>,true`-eko till en pågående sändning (för tidsloggen)."""

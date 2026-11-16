@@ -10,10 +10,31 @@ från SM5KRigSync/ecoder). Återansluter var 2:e sekund vid tapp.
 Utbruten ur ecoder_control.TciClient + SM5KRigSync.TciLink (som hade var sin kopia).
 """
 
+import re
 import threading
 import time
 
 import websocket
+
+
+_POWER_RE = re.compile(r"(^|;)\s*(start|stop)\s*;", re.IGNORECASE)
+
+
+def hello_with_power(hello, running):
+    """Returns a copy of the saved hello where the radio's power message (start; or stop;) matches the radio's
+    current state. The radio sends it once in the hello and again live when the device is stopped or started
+    (the on/off button in ExpertSDR). WSJT-X reads it in the hello to decide whether the radio is switched on, so a
+    stale 'stop;' makes it give up. If the hello has no power message, one is inserted before 'ready;'."""
+    word = "start;" if running else "stop;"
+    out, found = [], False
+    for text in hello:
+        new = _POWER_RE.sub(lambda m: m.group(1) + word, text)
+        found = found or new != text or bool(_POWER_RE.search(text))
+        out.append(new)
+    if not found:
+        pos = next((i for i, t in enumerate(out) if t.strip().lower().startswith("ready")), len(out))
+        out.insert(pos, word)
+    return out
 
 
 class TciLink:
@@ -100,6 +121,10 @@ class TciLink:
                         cmd = cmd.strip()
                         if cmd:
                             name, _, rest = cmd.partition(":")
+                            if name.lower() in ("start", "stop") and not rest:
+                                # Keep the saved hello in step with the radio (replaced as a whole, the
+                                # bridge and proxy read the list from other threads).
+                                self.hello = hello_with_power(self.hello, name.lower() == "start")
                             self._emit(kind="cmd", name=name.upper(),
                                        args=rest.split(",") if rest else [])
             except Exception as e:
