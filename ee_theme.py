@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ee_theme.py - Delat customtkinter-tema för SunSync (ExpertSDR3-look).
+"""ee_theme.py - Färger, typsnitt och mått för TCISync (ExpertSDR3-look).
 
 All utseendekonfiguration bor här så cockpiten och kommande moduler (encoder-
 styrning, sliders m.m.) delar samma look. Inget beteende, bara stil.
@@ -8,8 +8,6 @@ styrning, sliders m.m.) delar samma look. Inget beteende, bara stil.
 Färgtokens, typsnitt och mått är avlästa ur en ExpertSDR3-skärmdump (SunSDR2 DX);
 se ee_palette_reference.md för källa och brasklapp (närmevärden, kan pipett-trimmas).
 """
-
-import customtkinter as ctk
 
 # --- Färgpalett (verbatim ur ee_palette_reference.md) --------------------------
 PALETTE = {
@@ -36,36 +34,6 @@ METRICS = {"btn_height": 22, "btn_min_width": 40, "gap": 2, "radius": 3,
            "panel_pad": 8, "cell_pad": 6}
 
 
-def setup():
-    """Kör EN gång före första fönstret skapas: mörkt läge + egen DPI-hantering.
-
-    deactivate_automatic_dpi_awareness() matchar ecoder_control och håller mått/
-    typsnitt förutsägbara på Windows.
-    """
-    ctk.deactivate_automatic_dpi_awareness()
-    ctk.set_appearance_mode("dark")
-    ctk.set_default_color_theme("blue")
-
-
 def color(token):
     """Slå upp en färg ur paletten (KeyError avslöjar felstavade token direkt)."""
     return PALETTE[token]
-
-
-def font(role, bold=None, scale=1.0):
-    """Bygg en CTkFont för en roll. Anropas efter att en Tk-root finns.
-
-    Roller: 'freq_main', 'freq_secondary' (Consolas), annars FONT-storleken för
-    rollen i Segoe UI ('label', 'small', 'body'). `bold` kan tvinga vikt. `scale`
-    krymper/förstorar storleken (t.ex. 0.7 för en tätare vy).
-    """
-    def _sz(px):
-        return max(1, round(px * scale))
-    if role == "freq_main":
-        return ctk.CTkFont(family=FONT["freq_family"], size=_sz(FONT["freq_main"]),
-                           weight="bold" if bold is not False else "normal")
-    if role == "freq_secondary":
-        return ctk.CTkFont(family=FONT["freq_family"], size=_sz(FONT["freq_secondary"]),
-                           weight="bold" if bold else "normal")
-    return ctk.CTkFont(family=FONT["family"], size=_sz(FONT.get(role, FONT["body"])),
-                       weight="bold" if bold else "normal")
