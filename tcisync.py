@@ -13,7 +13,7 @@ import sys
 import os
 import json
 
-VERSION = "0.25.0"
+VERSION = "0.25.1"
 # WSJT-bron: två platser. "ramnas" = lokala radions RX2, "blecket" = fjärrradions RX1. Varje plats är
 # RX (grön), TX (röd), RX+TX (orange) eller av (grå); ett klick stegar platsen RX > TX > RX+TX.
 BRIDGE_PLACES = ("ramnas", "blecket")

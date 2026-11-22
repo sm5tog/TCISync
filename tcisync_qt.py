@@ -52,6 +52,7 @@ from tcisync import (VERSION, BRIDGE_PLACES, BRIDGE_TX_LIVE, BRIDGE_ROLE_TEXT, H
                      CELL_W, CELL_H, _build_slots, fmt_freq, fmt_split)
 
 M = th.METRICS
+WINDOW_H = 153      # fönsterhöjd (px), samma som rotorfönstret så att fönstren linjerar
 
 
 def _px_font(role, scale=1.0, bold=False):
@@ -530,6 +531,7 @@ class Cockpit(QWidget):
         self._font(split_btn, "split", "status", True)
         split_btn.clicked.connect(lambda _=False, rk=radio_key, i=rxi: self._on_split(rk, i))
         lay.addWidget(split_btn)
+        lay.addStretch(1)       # extra höjd hamnar under knappen, innehållet ligger överst
         self.split_btns[(radio_key, rxi)] = split_btn
         return f
 
@@ -1678,12 +1680,19 @@ class Cockpit(QWidget):
         self.adjustSize()
         if self.tweak:
             self.resize(680, 400)
+        elif self.classic:
+            self.resize(self.width(), WINDOW_H + 30)     # + OS-titelraden
+            self.setMinimumHeight(WINDOW_H + 30)
+        else:
+            # Fast höjd som linjerar med rotorfönstret och de andra programmen på skärmen.
+            self.setFixedHeight(WINDOW_H)
         cfg = load_settings()
         if "x" in cfg and "y" in cfg and not self.tweak:
             pt = QPoint(int(cfg["x"]), int(cfg["y"]))
             if QGuiApplication.screenAt(pt) is not None:
                 self.move(pt)
-        self.setMinimumSize(self.minimumSizeHint())
+        if self.tweak:
+            self.setMinimumSize(self.minimumSizeHint())
         self.show()
         set_topmost(self, self.ontop)
 
