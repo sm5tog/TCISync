@@ -43,7 +43,7 @@ from ecoder_hid import EcoderHid
 from ecoder_decode import Decoder, load_mapping
 from ecoder_leds import LedController
 
-VERSION = "0.24.3"
+VERSION = "0.24.4"
 # WSJT-bron: två platser. "ramnas" = lokala radions RX2, "blecket" = fjärrradions RX1. Varje plats är
 # RX (grön), TX (röd), RX+TX (orange) eller av (grå); ett klick stegar platsen RX > TX > RX+TX.
 BRIDGE_PLACES = ("ramnas", "blecket")
@@ -127,6 +127,14 @@ def fmt_freq(hz):
     return "{:,}".format(int(hz)).replace(",", ".")
 
 
+def fmt_split(freq_a, freq_b):
+    """Split-knappens text: VFO B minus VFO A i kHz med tecken, t.ex. "Split +1.07"."""
+    if freq_a is None or freq_b is None:
+        return "Split"
+    khz = (int(freq_b) - int(freq_a)) / 1000.0
+    return "Split %.2f" % khz if round(khz, 2) == 0 else "Split %+.2f" % khz
+
+
 class Cockpit:
     def __init__(self, root, tweak=False, classic=False, ontop=True):
         self.root = root
@@ -154,6 +162,7 @@ class Cockpit:
         # Render-cache: senast satta värde per widget så .configure bara körs vid ändring
         # (ctk .configure ritar om en canvas varje gång -> annars omritningsstorm).
         self._cell_text = {}
+        self.split_btns = {}    # (radio_key, rx_idx) -> CTkButton (Split + diff)
         self._outer_bc = {}
         self._inner_bc = {}
         self._inner_fg = {}
@@ -179,6 +188,7 @@ class Cockpit:
         # "status"-gruppen skalar nu synk-stripan (kryssrutor + knapp), statusraden borttagen.
         self.f_status = self._reg_font("label", "status")
         self.f_btn = self._reg_font("small", "status", bold=True)
+        self.f_split = self._reg_font("split", "status", bold=True)   # Split-knappen, större än f_btn
 
         cw_cfg = dict(DEFAULT_CW_SETTINGS)
         cw_cfg.update(load_settings().get("cw", {}))
@@ -468,7 +478,7 @@ class Cockpit:
             # för cellens bakgrund/kant.
             self._wheel_cell[lbl._label] = key
 
-        split_btn = ctk.CTkButton(f, text="Split", font=self.f_btn,
+        split_btn = ctk.CTkButton(f, text="Split", font=self.f_split,
                                   height=th.METRICS["btn_height"],
                                   corner_radius=M["radius"],
                                   fg_color=th.color("btn_idle_bg"),
@@ -476,6 +486,7 @@ class Cockpit:
                                   text_color=th.color("btn_text"),
                                   command=lambda rk=radio_key, i=rxi: self._on_split(rk, i))
         split_btn.pack(fill="x", padx=M["panel_pad"], pady=(0, M["panel_pad"] - 4))
+        self.split_btns[(radio_key, rxi)] = split_btn
 
     def _cell_click(self, key, which):
         radio_key, rxi, vfo = key
@@ -1104,6 +1115,12 @@ class Cockpit:
             if cache.get(key) != txt:
                 cache[key] = txt
                 lbl.configure(text=txt)
+        for (rk, rxi), btn in self.split_btns.items():
+            fr = self.station.by_key(rk).rx[rxi].freq
+            txt = fmt_split(fr[0], fr[1])
+            if cache.get(("split", rk, rxi)) != txt:
+                cache[("split", rk, rxi)] = txt
+                btn.configure(text=txt)
         self._refresh_markers()
 
     def _refresh_markers(self):

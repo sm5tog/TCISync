@@ -30,7 +30,7 @@ PALETTE = {
 }
 
 FONT = {"family": "Segoe UI", "freq_family": "Consolas",
-        "label": 9, "small": 8, "body": 10, "freq_main": 28, "freq_secondary": 14}
+        "label": 9, "small": 8, "body": 10, "split": 12, "freq_main": 28, "freq_secondary": 14}
 
 METRICS = {"btn_height": 22, "btn_min_width": 40, "gap": 2, "radius": 3,
            "panel_pad": 8, "cell_pad": 6}
